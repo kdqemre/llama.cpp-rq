@@ -156,6 +156,9 @@ extern "C" {
         LLAMA_FTYPE_MOSTLY_NVFP4         = 39, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_Q1_0          = 40, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_Q2_0          = 41, // except 1d tensors
+        LLAMA_FTYPE_MOSTLY_RQ4_K_L       = 47, // except 1d tensors
+        LLAMA_FTYPE_MOSTLY_RQ3_K_L       = 48, // except 1d tensors
+        LLAMA_FTYPE_MOSTLY_RQ2_K_L       = 49, // 2.50 bpw Rotated Quant 2-bit Large
 
         LLAMA_FTYPE_GUESSED = 1024, // not specified in the model file
     };

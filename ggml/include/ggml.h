@@ -430,7 +430,10 @@ extern "C" {
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
         GGML_TYPE_Q1_0    = 41,
         GGML_TYPE_Q2_0    = 42,
-        GGML_TYPE_COUNT   = 43,
+        GGML_TYPE_RQ4 = 47, // Rotated Quant 4-bit Large with WHT + Lloyd-Max 16-level codebook (4.5 bpw)
+        GGML_TYPE_RQ3 = 48, // Rotated Quant 3-bit Large with WHT + 3-bit scale+min (3.5 bpw)
+        GGML_TYPE_RQ2 = 49, // Rotated Quant 2-bit Large with WHT + scale+min (2.5 bpw)
+        GGML_TYPE_COUNT   = 50,
     };
 
     // precision

@@ -1,4 +1,7 @@
 #include "quantize.cuh"
+#include "rq4-signs.cuh"
+#include "rq3-signs.cuh"
+#include "rq2-signs.cuh"
 #include <cstdint>
 
 #if defined(BLACKWELL_MMA_AVAILABLE)
@@ -454,11 +457,11 @@ static __global__ void quantize_mmq_mxfp4(const float * __restrict__ x,
 }
 
 // scatter: grid over tokens, quantize once, write to all the token's compact rows
-template <mmq_q8_1_ds_layout ds_layout, bool scatter>
+template <mmq_q8_1_ds_layout ds_layout, bool scatter, bool rq3_signs = false>
 static __global__ void quantize_mmq_q8_1(
         const float * __restrict__ x, const int32_t * __restrict__ ids, void * __restrict__ vy,
         const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
-        const int64_t ne0, const int ne1, const int ne2, const int n_expert_used) {
+        const int64_t ne0, const int ne1, const int ne2, const int n_expert_used, const bool rq4_rotate, const bool rq2_signs) {
 
     constexpr int vals_per_scale = ds_layout == MMQ_Q8_1_DS_LAYOUT_D2S6 ? 64 : 32;
     constexpr int vals_per_sum   = ds_layout == MMQ_Q8_1_DS_LAYOUT_D2S6 ? 16 : 32;
@@ -488,12 +491,66 @@ static __global__ void quantize_mmq_q8_1(
     const int64_t k_block = i0 / QK8_1_MMQ; // column block in the channel
     const int64_t iqs     = i0 % QK8_1_MMQ; // quant index in block
 
-    // Load 4 floats per thread and calculate max. abs. value between them:
-    const float4 xi = i0 < ne00 ? x4[(base_idx + i00)/4] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-    float amax = fabsf(xi.x);
-    amax = fmaxf(amax, fabsf(xi.y));
-    amax = fmaxf(amax, fabsf(xi.z));
-    amax = fmaxf(amax, fabsf(xi.w));
+    // Load 4 floats per thread (positions i0..i0+3 within the row):
+    float4 v = i0 < ne00 ? x4[(base_idx + i00)/4] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+
+    if (rq4_rotate) {
+        // RQ4 forward randomized Hadamard transform, FUSED into the MMQ quantizer so the
+        // separate rq4_copy_rotate_act FP32 pass (+ its kernel launches) is eliminated.
+        // One 32-element WHT block == 8 threads x 4 vals (position-in-block = 4*(tid&7)+slot).
+        // signs per position, then 5-stage butterfly matching rq4_copy_rotate_act_kernel:
+        //   s=1,2 intra-thread on the float4 slots; s=4,8,16 cross-thread via warp shuffles
+        //   (offsets 1,2,4; condition position-bit = threadIdx.x bit 0/1/2). Then 1/sqrt(32).
+        // The amax/sum/quantize below then run on the ROTATED values (d = amax of rotated;
+        // sum = rotated sum, which is the correct q8_1 min term -- matches the old 2-pass path).
+        if constexpr (rq3_signs) {
+            v.x *= ggml_cuda_rq3_signs_dev[(i0+0) & 31];
+            v.y *= ggml_cuda_rq3_signs_dev[(i0+1) & 31];
+            v.z *= ggml_cuda_rq3_signs_dev[(i0+2) & 31];
+            v.w *= ggml_cuda_rq3_signs_dev[(i0+3) & 31];
+        } else if (rq2_signs) {
+            v.x *= ggml_cuda_rq2_signs_dev[(i0+0) & 31];
+            v.y *= ggml_cuda_rq2_signs_dev[(i0+1) & 31];
+            v.z *= ggml_cuda_rq2_signs_dev[(i0+2) & 31];
+            v.w *= ggml_cuda_rq2_signs_dev[(i0+3) & 31];
+        } else {
+            v.x *= ggml_cuda_rq4_signs_dev[(i0+0) & 31];
+            v.y *= ggml_cuda_rq4_signs_dev[(i0+1) & 31];
+            v.z *= ggml_cuda_rq4_signs_dev[(i0+2) & 31];
+            v.w *= ggml_cuda_rq4_signs_dev[(i0+3) & 31];
+        }
+        // s=1: pair slots 0<->1, 2<->3 (pos&1 -> slots 1,3 subtract)
+        { float t = v.x; v.x = v.x + v.y; v.y = t - v.y;
+          float u = v.z; v.z = v.z + v.w; v.w = u - v.w; }
+        // s=2: pair slots 0<->2, 1<->3 (pos&2 -> slots 2,3 subtract)
+        { float t = v.x; v.x = v.x + v.z; v.z = t - v.z;
+          float u = v.y; v.y = v.y + v.w; v.w = u - v.w; }
+        // s=4:  pair tid^1, same slot (pos&4 = threadIdx.x bit 0)
+        // s=8:  pair tid^2            (pos&8 = threadIdx.x bit 1)
+        // s=16: pair tid^4            (pos&16= threadIdx.x bit 2)
+        { float o;
+          o = __shfl_xor_sync(0xFFFFFFFF, v.x, 1); v.x = (threadIdx.x & 1) ? o - v.x : o + v.x;
+          o = __shfl_xor_sync(0xFFFFFFFF, v.y, 1); v.y = (threadIdx.x & 1) ? o - v.y : o + v.y;
+          o = __shfl_xor_sync(0xFFFFFFFF, v.z, 1); v.z = (threadIdx.x & 1) ? o - v.z : o + v.z;
+          o = __shfl_xor_sync(0xFFFFFFFF, v.w, 1); v.w = (threadIdx.x & 1) ? o - v.w : o + v.w; }
+        { float o;
+          o = __shfl_xor_sync(0xFFFFFFFF, v.x, 2); v.x = (threadIdx.x & 2) ? o - v.x : o + v.x;
+          o = __shfl_xor_sync(0xFFFFFFFF, v.y, 2); v.y = (threadIdx.x & 2) ? o - v.y : o + v.y;
+          o = __shfl_xor_sync(0xFFFFFFFF, v.z, 2); v.z = (threadIdx.x & 2) ? o - v.z : o + v.z;
+          o = __shfl_xor_sync(0xFFFFFFFF, v.w, 2); v.w = (threadIdx.x & 2) ? o - v.w : o + v.w; }
+        { float o;
+          o = __shfl_xor_sync(0xFFFFFFFF, v.x, 4); v.x = (threadIdx.x & 4) ? o - v.x : o + v.x;
+          o = __shfl_xor_sync(0xFFFFFFFF, v.y, 4); v.y = (threadIdx.x & 4) ? o - v.y : o + v.y;
+          o = __shfl_xor_sync(0xFFFFFFFF, v.z, 4); v.z = (threadIdx.x & 4) ? o - v.z : o + v.z;
+          o = __shfl_xor_sync(0xFFFFFFFF, v.w, 4); v.w = (threadIdx.x & 4) ? o - v.w : o + v.w; }
+        static constexpr float inv_sqrt32 = 0.1767766952966369f; // 1/sqrt(32)
+        v.x *= inv_sqrt32; v.y *= inv_sqrt32; v.z *= inv_sqrt32; v.w *= inv_sqrt32;
+    }
+
+    float amax = fabsf(v.x);
+    amax = fmaxf(amax, fabsf(v.y));
+    amax = fmaxf(amax, fabsf(v.z));
+    amax = fmaxf(amax, fabsf(v.w));
 
     // Exchange max. abs. value between vals_per_scale/4 threads.
 #pragma unroll
@@ -503,7 +560,7 @@ static __global__ void quantize_mmq_q8_1(
 
     float sum;
     if (ds_layout != MMQ_Q8_1_DS_LAYOUT_D4) {
-        sum = xi.x + xi.y + xi.z + xi.w;
+        sum = v.x + v.y + v.z + v.w;
 
         // Calculate sums across vals_per_sum/4 threads.
 #pragma unroll
@@ -514,10 +571,10 @@ static __global__ void quantize_mmq_q8_1(
 
     const float d_inv = 127.0f / amax;
     char4 q;
-    q.x = roundf(xi.x*d_inv);
-    q.y = roundf(xi.y*d_inv);
-    q.z = roundf(xi.z*d_inv);
-    q.w = roundf(xi.w*d_inv);
+    q.x = roundf(v.x*d_inv);
+    q.y = roundf(v.y*d_inv);
+    q.z = roundf(v.z*d_inv);
+    q.w = roundf(v.w*d_inv);
     const float d = 1.0f / d_inv;
 
     // write the block once (normal) or to each of the token's compact rows (scatter)
@@ -572,29 +629,27 @@ void quantize_row_q8_1_cuda(
     GGML_UNUSED(type_src0);
 }
 
-void quantize_mmq_q8_1_cuda(
+// Launch quantize_mmq_q8_1 selecting ds_layout at runtime; scatter and rq3_signs are compile-time.
+// rq3_signs=true routes the fused WHT to the RQ3 sign table (ggml_cuda_rq3_signs_dev);
+// rq3_signs=false keeps the RQ4 sign table (ggml_cuda_rq4_signs_dev), byte-identical to pre-RQ3.
+template <bool scatter, bool rq3_signs>
+static void launch_quantize_mmq_q8_1(
         const float * x, const int32_t * ids, void * vy, const ggml_type type_src0,
         const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
-        const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3, cudaStream_t stream) {
-    GGML_ASSERT(ne00 % 4 == 0);
-    GGML_ASSERT(ne0 % QK8_1_MMQ == 0);
-
-    // ne1 tends to assume the highest values, therefore use it as the "x" dimension of the CUDA grid:
-    const int64_t block_num_y = (ne0 + 4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ - 1) / (4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ);
-    const dim3 num_blocks(ne1, block_num_y, ne2*ne3);
-    const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE_MMQ, 1, 1);
+        const int64_t ne0, const int ne1, const int ne2, const int n_expert_used,
+        const bool rq4_rotate, const bool rq2_signs, const dim3 num_blocks, const dim3 block_size, cudaStream_t stream) {
     switch (mmq_get_q8_1_ds_layout(type_src0)) {
         case MMQ_Q8_1_DS_LAYOUT_D4:
-            quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D4, false>
-                <<<num_blocks, block_size, 0, stream>>>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2, /*n_expert_used=*/0);
+            quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D4, scatter, rq3_signs>
+                <<<num_blocks, block_size, 0, stream>>>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2, n_expert_used, rq4_rotate, rq2_signs);
             break;
         case MMQ_Q8_1_DS_LAYOUT_DS4:
-            quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_DS4, false>
-                <<<num_blocks, block_size, 0, stream>>>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2, /*n_expert_used=*/0);
+            quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_DS4, scatter, rq3_signs>
+                <<<num_blocks, block_size, 0, stream>>>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2, n_expert_used, rq4_rotate, rq2_signs);
             break;
         case MMQ_Q8_1_DS_LAYOUT_D2S6:
-            quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D2S6, false>
-                <<<num_blocks, block_size, 0, stream>>>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2, /*n_expert_used=*/0);
+            quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D2S6, scatter, rq3_signs>
+                <<<num_blocks, block_size, 0, stream>>>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2, n_expert_used, rq4_rotate, rq2_signs);
             break;
         default:
             GGML_ABORT("fatal error");
@@ -602,33 +657,51 @@ void quantize_mmq_q8_1_cuda(
     }
 }
 
+void quantize_mmq_q8_1_cuda(
+        const float * x, const int32_t * ids, void * vy, const ggml_type type_src0,
+        const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
+        const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3,
+        const bool rq4_rotate, const bool rq3_signs, const bool rq2_signs, cudaStream_t stream) {
+    GGML_ASSERT(ne00 % 4 == 0);
+    GGML_ASSERT(ne0 % QK8_1_MMQ == 0);
+    if (rq4_rotate) {
+        if (rq3_signs) ggml_cuda_rq3_init_signs();
+        else if (rq2_signs) ggml_cuda_rq2_init_signs();
+        else           ggml_cuda_rq4_init_signs();
+    }
+
+    // ne1 tends to assume the highest values, therefore use it as the "x" dimension of the CUDA grid:
+    const int64_t block_num_y = (ne0 + 4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ - 1) / (4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ);
+    const dim3 num_blocks(ne1, block_num_y, ne2*ne3);
+    const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE_MMQ, 1, 1);
+    if (rq3_signs) {
+        launch_quantize_mmq_q8_1<false, true>(x, ids, vy, type_src0, ne00, s01, s02, s03, ne0, (int) ne1, ne2, /*n_expert_used=*/0, rq4_rotate, rq2_signs, num_blocks, block_size, stream);
+    } else {
+        launch_quantize_mmq_q8_1<false, false>(x, ids, vy, type_src0, ne00, s01, s02, s03, ne0, (int) ne1, ne2, /*n_expert_used=*/0, rq4_rotate, rq2_signs, num_blocks, block_size, stream);
+    }
+}
+
 // scatter=true reuses the quant kernel: grid over tokens, ids = inverse map (token slot -> compact row)
 void quantize_scatter_mmq_q8_1_cuda(
         const float * x, const int32_t * ids_src1_inv, void * vy, const ggml_type type_src0,
         const int64_t ne00, const int64_t stride_token, const int64_t ne0,
-        const int64_t n_tokens, const int64_t nrows_dst, const int n_expert_used, cudaStream_t stream) {
+        const int64_t n_tokens, const int64_t nrows_dst, const int n_expert_used,
+        const bool rq4_rotate, const bool rq3_signs, const bool rq2_signs, cudaStream_t stream) {
     GGML_ASSERT(ne00 % 4 == 0);
     GGML_ASSERT(ne0 % QK8_1_MMQ == 0);
+    if (rq4_rotate) {
+        if (rq3_signs) ggml_cuda_rq3_init_signs();
+        else if (rq2_signs) ggml_cuda_rq2_init_signs();
+        else           ggml_cuda_rq4_init_signs();
+    }
 
     const int64_t block_num_y = (ne0 + 4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ - 1) / (4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ);
     const dim3 num_blocks(n_tokens, block_num_y, 1);
     const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE_MMQ, 1, 1);
-    switch (mmq_get_q8_1_ds_layout(type_src0)) {
-        case MMQ_Q8_1_DS_LAYOUT_D4:
-            quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D4, true><<<num_blocks, block_size, 0, stream>>>(
-                x, ids_src1_inv, vy, ne00, /*s01=*/0, /*s02=*/stride_token, /*s03=*/0, ne0, /*ne1=*/(int) nrows_dst, /*ne2=*/1, n_expert_used);
-            break;
-        case MMQ_Q8_1_DS_LAYOUT_DS4:
-            quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_DS4, true><<<num_blocks, block_size, 0, stream>>>(
-                x, ids_src1_inv, vy, ne00, /*s01=*/0, /*s02=*/stride_token, /*s03=*/0, ne0, /*ne1=*/(int) nrows_dst, /*ne2=*/1, n_expert_used);
-            break;
-        case MMQ_Q8_1_DS_LAYOUT_D2S6:
-            quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D2S6, true><<<num_blocks, block_size, 0, stream>>>(
-                x, ids_src1_inv, vy, ne00, /*s01=*/0, /*s02=*/stride_token, /*s03=*/0, ne0, /*ne1=*/(int) nrows_dst, /*ne2=*/1, n_expert_used);
-            break;
-        default:
-            GGML_ABORT("fatal error");
-            break;
+    if (rq3_signs) {
+        launch_quantize_mmq_q8_1<true, true>(x, ids_src1_inv, vy, type_src0, ne00, /*s01=*/0, /*s02=*/stride_token, /*s03=*/0, ne0, /*ne1=*/(int) nrows_dst, /*ne2=*/1, n_expert_used, rq4_rotate, rq2_signs, num_blocks, block_size, stream);
+    } else {
+        launch_quantize_mmq_q8_1<true, false>(x, ids_src1_inv, vy, type_src0, ne00, /*s01=*/0, /*s02=*/stride_token, /*s03=*/0, ne0, /*ne1=*/(int) nrows_dst, /*ne2=*/1, n_expert_used, rq4_rotate, rq2_signs, num_blocks, block_size, stream);
     }
 }
 

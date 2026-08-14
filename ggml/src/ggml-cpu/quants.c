@@ -1337,3 +1337,178 @@ void quantize_row_iq4_xs(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, 
     assert(k % QK_K == 0);
     quantize_iq4_xs(x, y, 1, k, NULL);
 }
+
+// Local unpacking (duplicated from ggml-quants.c get_scale_min_k4)
+static inline void unpack_scale_min_k4(int j, const uint8_t * q, uint8_t * d, uint8_t * m) {
+    if (j < 4) {
+        *d = q[j] & 63; *m = q[j + 4] & 63;
+    } else {
+        *d = (q[j+4] & 0xF) | ((q[j-4] >> 6) << 4);
+        *m = (q[j+4] >>  4) | ((q[j-0] >> 6) << 4);
+    }
+}
+
+// Extern declarations for RQ4 codebook constants (defined in ggml-quants.c)
+extern const float RQ4_CENTROIDS[16];
+extern const float RQ4_SIGNS[32];
+// RQ4 sign-pattern parameterization (research sweep). Defined in
+// ggml-quants.c. Parses RQ4_SIGNS (32-char '+'/'-' string) once and caches;
+// default (unset/malformed) == RQ4_SIGNS[] golden literal (byte-identical).
+extern const float * rq4_signs_ptr(void);
+
+void ggml_vec_dot_rq4_f32(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(nrc == 1);
+    UNUSED(nrc); UNUSED(bs); UNUSED(bx); UNUSED(by);
+
+    const block_rq4 * GGML_RESTRICT x = vx;
+    const float * GGML_RESTRICT y = vy;
+    const int nb = n / QK_RQ4;
+    float sumf = 0.0f;
+
+    for (int i = 0; i < nb; ++i) {
+        const float d   = GGML_CPU_FP16_TO_FP32(x[i].d);
+        const float dmin = GGML_CPU_FP16_TO_FP32(x[i].dmin);
+
+        int is = 0;
+        uint8_t sc, m;
+        for (int j = 0; j < QK_RQ4; j += 64) {
+            unpack_scale_min_k4(is + 0, x[i].scales, &sc, &m);
+            const float d1 = d * sc; const float m1 = dmin * m;
+            unpack_scale_min_k4(is + 1, x[i].scales, &sc, &m);
+            const float d2 = d * sc; const float m2 = dmin * m;
+
+            float sub0[32], sub1[32];
+            const uint8_t * q = x[i].qs + (is/2) * 32;
+            for (int l = 0; l < 32; ++l) {
+                sub0[l] = d1 * (q[l] & 0xF) - m1;
+                sub1[l] = d2 * (q[l] >> 4)  - m2;
+            }
+
+            for (int step = 1; step < 32; step <<= 1) {
+                for (int k = 0; k < 32; k += step << 1) {
+                    for (int l = k; l < k + step; l++) {
+                        float a = sub0[l], b = sub0[l + step]; sub0[l] = a + b; sub0[l + step] = a - b;
+                        float c = sub1[l], d = sub1[l + step]; sub1[l] = c + d; sub1[l + step] = c - d;
+                    }
+                }
+            }
+            const float nrm = 1.0f / sqrtf(32.0f);
+            const float * signs = rq4_signs_ptr();
+            for (int l = 0; l < 32; ++l) {
+                sub0[l] = sub0[l] * nrm * signs[l];
+                sub1[l] = sub1[l] * nrm * signs[l];
+            }
+
+            const float * ay = y + i * QK_RQ4 + j;
+            for (int l = 0; l < 32; ++l) sumf += ay[l]      * sub0[l];
+            for (int l = 0; l < 32; ++l) sumf += ay[32 + l] * sub1[l];
+            is += 2;
+        }
+    }
+    *s = sumf;
+}
+
+// Extern: RQ3 sign pattern (defined in ggml-quants.c, env RQ3_SIGNS).
+extern const float * rq3_signs_ptr(void);
+extern const float RQ3_SIGNS[32];
+
+void ggml_vec_dot_rq3_f32(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(nrc == 1);
+    UNUSED(nrc); UNUSED(bs); UNUSED(bx); UNUSED(by);
+
+    const block_rq3 * GGML_RESTRICT x = vx;
+    const float * GGML_RESTRICT y = vy;
+    const int nb = n / QK_RQ3;
+    float sumf = 0.0f;
+
+    for (int i = 0; i < nb; ++i) {
+        const float d    = GGML_CPU_FP16_TO_FP32(x[i].d);
+        const float dmin = GGML_CPU_FP16_TO_FP32(x[i].dmin);
+        const uint8_t * qs    = x[i].qs;
+        const uint8_t * hmask = x[i].hmask;
+
+        uint8_t sc, m;
+        int is = 0;
+        for (int j = 0; j < QK_RQ3; j += 32) {
+            unpack_scale_min_k4(is, x[i].scales, &sc, &m);
+            const float d1 = d * sc; const float m1 = dmin * m;
+
+            // Unpack 3-bit levels (bits 0-1 in qs[j/4+l/4], bit 2 in hmask),
+            // reconstruct rotated-domain weight d1*L - m1, then inverse WHT.
+            float sub[32];
+            for (int l = 0; l < 32; ++l) {
+                const int gi = j + l;
+                const uint8_t lvl = ((qs[gi/4] >> (2*(gi & 3))) & 3) | (((hmask[gi/8] >> (gi & 7)) & 1) << 2);
+                sub[l] = d1 * lvl - m1;
+            }
+
+            for (int step = 1; step < 32; step <<= 1) {
+                for (int k = 0; k < 32; k += step << 1) {
+                    for (int l = k; l < k + step; l++) {
+                        float a = sub[l], b = sub[l + step];
+                        sub[l] = a + b; sub[l + step] = a - b;
+                    }
+                }
+            }
+            const float nrm = 1.0f / sqrtf(32.0f);
+            const float * signs = rq3_signs_ptr();
+            for (int l = 0; l < 32; ++l) sub[l] = sub[l] * nrm * signs[l];
+
+            const float * ay = y + i * QK_RQ3 + j;
+            for (int l = 0; l < 32; ++l) sumf += ay[l] * sub[l];
+            ++is;
+        }
+    }
+    *s = sumf;
+}
+// Extern: RQ2 sign pattern (defined in ggml-quants.c, env RQ2_SIGNS).
+extern const float * rq2_signs_ptr(void);
+
+void ggml_vec_dot_rq2_f32(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(nrc == 1);
+    UNUSED(nrc); UNUSED(bs); UNUSED(bx); UNUSED(by);
+
+    const block_rq2 * GGML_RESTRICT x = vx;
+    const float * GGML_RESTRICT y = vy;
+    const int nb = n / QK_RQ2;
+    float sumf = 0.0f;
+
+    for (int i = 0; i < nb; ++i) {
+        const float d    = GGML_CPU_FP16_TO_FP32(x[i].d);
+        const float dmin = GGML_CPU_FP16_TO_FP32(x[i].dmin);
+        const uint8_t * qs = x[i].qs;
+
+        uint8_t sc, m;
+        int is = 0;
+        for (int j = 0; j < QK_RQ2; j += 32) {
+            unpack_scale_min_k4(is, x[i].scales, &sc, &m);
+            const float d1 = d * sc; const float m1 = dmin * m;
+
+            // Unpack 2-bit levels (bits 0-1 in qs), reconstruct rotated-domain
+            // weight d1*L - m1, then inverse WHT.
+            float sub[32];
+            for (int l = 0; l < 32; ++l) {
+                const int gi = j + l;
+                const uint8_t lvl = (qs[gi/4] >> (2*(gi & 3))) & 3;
+                sub[l] = d1 * lvl - m1;
+            }
+
+            for (int step = 1; step < 32; step <<= 1) {
+                for (int k = 0; k < 32; k += step << 1) {
+                    for (int l = k; l < k + step; l++) {
+                        float a = sub[l], b = sub[l + step];
+                        sub[l] = a + b; sub[l + step] = a - b;
+                    }
+                }
+            }
+            const float nrm = 1.0f / sqrtf(32.0f);
+            const float * signs = rq2_signs_ptr();
+            for (int l = 0; l < 32; ++l) sub[l] = sub[l] * nrm * signs[l];
+
+            const float * ay = y + i * QK_RQ2 + j;
+            for (int l = 0; l < 32; ++l) sumf += ay[l] * sub[l];
+            ++is;
+        }
+    }
+    *s = sumf;
+}

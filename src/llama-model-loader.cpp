@@ -58,6 +58,9 @@ const char * llama_ftype_name(llama_ftype ftype) {
         case LLAMA_FTYPE_MOSTLY_Q6_K:      name = LLAMA_FTYPE_PREFIX "Q6_K"; break;
         case LLAMA_FTYPE_MOSTLY_TQ1_0:     name = LLAMA_FTYPE_PREFIX "TQ1_0 - 1.69 bpw ternary"; break;
         case LLAMA_FTYPE_MOSTLY_TQ2_0:     name = LLAMA_FTYPE_PREFIX "TQ2_0 - 2.06 bpw ternary"; break;
+        case LLAMA_FTYPE_MOSTLY_RQ4_K_L:   name = LLAMA_FTYPE_PREFIX "RQ4_K_L - 4.50 bpw Rotated Quant 4-bit Large"; break;
+        case LLAMA_FTYPE_MOSTLY_RQ3_K_L:   name = LLAMA_FTYPE_PREFIX "RQ3_K_L - 3.50 bpw Rotated Quant 3-bit Large"; break;
+        case LLAMA_FTYPE_MOSTLY_RQ2_K_L:   name = LLAMA_FTYPE_PREFIX "RQ2_K_L - 2.50 bpw Rotated Quant 2-bit Large"; break;
         case LLAMA_FTYPE_MOSTLY_IQ2_XXS:   name = LLAMA_FTYPE_PREFIX "IQ2_XXS - 2.0625 bpw"; break;
         case LLAMA_FTYPE_MOSTLY_IQ2_XS:    name = LLAMA_FTYPE_PREFIX "IQ2_XS - 2.3125 bpw"; break;
         case LLAMA_FTYPE_MOSTLY_IQ2_S:     name = LLAMA_FTYPE_PREFIX "IQ2_S - 2.5 bpw"; break;
@@ -759,6 +762,9 @@ llama_model_loader::llama_model_loader(
             case GGML_TYPE_NVFP4:   ftype = LLAMA_FTYPE_MOSTLY_NVFP4;   break;
             case GGML_TYPE_Q1_0:    ftype = LLAMA_FTYPE_MOSTLY_Q1_0;    break;
             case GGML_TYPE_Q2_0:    ftype = LLAMA_FTYPE_MOSTLY_Q2_0;    break;
+            case GGML_TYPE_RQ4:     ftype = LLAMA_FTYPE_MOSTLY_RQ4_K_L;   break;
+            case GGML_TYPE_RQ3:     ftype = LLAMA_FTYPE_MOSTLY_RQ3_K_L;   break;
+            case GGML_TYPE_RQ2:     ftype = LLAMA_FTYPE_MOSTLY_RQ2_K_L;   break;
             default:
                 {
                     LLAMA_LOG_WARN("%s: unknown type %s\n", __func__, ggml_type_name(type_max));

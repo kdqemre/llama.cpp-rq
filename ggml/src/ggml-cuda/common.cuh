@@ -1056,6 +1056,26 @@ struct ggml_cuda_type_traits<GGML_TYPE_Q4_K> {
 };
 
 template<>
+struct ggml_cuda_type_traits<GGML_TYPE_RQ4> {
+    static constexpr int qk = QK_K;       // 256
+    static constexpr int qr = QR4_K;      // reuse Q4_K's row count
+    static constexpr int qi = QI4_K;      // reuse Q4_K's inner count
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_RQ3> {
+    static constexpr int qk = QK_K;       // 256
+    static constexpr int qr = QR4_K;      // same dot geometry as Q4_K/RQ4
+    static constexpr int qi = QI4_K;
+};
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_RQ2> {
+    static constexpr int qk = QK_K;       // 256
+    static constexpr int qr = QR4_K;      // same dot geometry as Q4_K/RQ4/RQ3
+    static constexpr int qi = QI4_K;
+};
+
+template<>
 struct ggml_cuda_type_traits<GGML_TYPE_Q5_K> {
     static constexpr int qk = QK_K;
     static constexpr int qr = QR5_K;

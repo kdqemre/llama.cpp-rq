@@ -5579,6 +5579,18 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
             {
                 VALIDATE_ROW_DATA_DM_F16_IMPL(block_q4_K, data, nb, d, dmin);
             } break;
+        case GGML_TYPE_RQ4:
+            {
+                VALIDATE_ROW_DATA_DM_F16_IMPL(block_rq4, data, nb, d, dmin);
+            } break;
+        case GGML_TYPE_RQ3:
+            {
+                VALIDATE_ROW_DATA_DM_F16_IMPL(block_rq3, data, nb, d, dmin);
+            } break;
+        case GGML_TYPE_RQ2:
+            {
+                VALIDATE_ROW_DATA_DM_F16_IMPL(block_rq2, data, nb, d, dmin);
+            } break;
         case GGML_TYPE_Q5_K:
             {
                 VALIDATE_ROW_DATA_DM_F16_IMPL(block_q5_K, data, nb, d, dmin);
@@ -5665,3 +5677,728 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
 
     return true;
 }
+
+//
+// TurboQuant RQ4: WHT rotation + 4-bit Lloyd-Max 16-level codebook (4.5 bpw)
+//
+
+// Lloyd-Max 16-level centroids for N(0,1), MSE = 0.00812
+const float RQ4_CENTROIDS[16] = {
+    -2.732127f, -2.068495f, -1.617513f, -1.255729f,
+    -0.941906f, -0.656424f, -0.387837f, -0.128323f,
+     0.128323f,  0.387837f,  0.656424f,  0.941906f,
+     1.255729f,  1.617513f,  2.068495f,  2.732127f
+};
+
+static const float RQ4_BOUNDARIES[15] = {
+    -2.400311f, -1.843004f, -1.436621f, -1.098817f,
+    -0.799165f, -0.522130f, -0.258080f,  0.000000f,
+     0.258080f,  0.522130f,  0.799165f,  1.098817f,
+     1.436621f,  1.843004f,  2.400311f
+};
+
+// DEFAULT for this monolith repo: the rand2 pattern (random.seed(2) derived),
+// baked in so the no-env-var default already matches the validated rand2 sweep.
+const float RQ4_SIGNS[32] = {
+    -1.0f, +1.0f, +1.0f, -1.0f, -1.0f, +1.0f, -1.0f, +1.0f,
+    -1.0f, +1.0f, -1.0f, +1.0f, +1.0f, +1.0f, +1.0f, +1.0f,
+    +1.0f, +1.0f, -1.0f, -1.0f, -1.0f, -1.0f, +1.0f, +1.0f,
+    +1.0f, -1.0f, -1.0f, -1.0f, +1.0f, +1.0f, +1.0f, -1.0f,
+};
+
+// RQ4 sign-pattern parameterization (research sweep). The diagonal of the
+// per-32-element randomized Hadamard transform is a RUNTIME parameter via env
+// var RQ4_SIGNS = exactly 32 chars of '+'/'-' (lane-wise ±1). Default (env unset
+// or malformed): the golden-ratio literal above, byte-identical to the historical
+// compile-time constant. Parsed once per process and cached. The quantizer
+// (llama-quantize) and inference (llama-cli/perplexity) are separate processes —
+// launch both with the SAME RQ4_SIGNS so the GGUF's baked rotation matches the
+// runtime activation rotation.
+// Non-static: ggml-cpu/quants.c's ggml_vec_dot_rq4_f32 (CPU runtime dot path)
+// also references it so the CPU dot uses the same pattern as the quantizer.
+const float * rq4_signs_ptr(void) {
+    static float cached[32];
+    static bool inited = false;
+    if (inited) return cached;
+    bool ok = false;
+    const char * env = getenv("RQ4_SIGNS");
+    if (env) {
+        size_t n = 0;
+        while (env[n] && n <= 32) ++n;
+        if (n == 32) {
+            ok = true;
+            for (int i = 0; i < 32; ++i) {
+                if      (env[i] == '+') cached[i] = +1.0f;
+                else if (env[i] == '-') cached[i] = -1.0f;
+                else { ok = false; break; }
+            }
+        }
+    }
+    if (!ok) memcpy(cached, RQ4_SIGNS, sizeof(RQ4_SIGNS));
+    inited = true;
+    return cached;
+}
+
+// RQ4 no-outlier quantization mode (research sweep). When RQ4_NO_OUTLIER is
+// set, quantize_row_rq4_ref() skips outlier extraction entirely and fits the
+// 4-bit uniform quant on the FULL rotated weights (all ol_loc[] = 0x1F sentinel,
+// all ol_delta[] = 0). Default (unset): the current full quantizer with
+// outliers, byte-identical.
+static bool rq4_no_outlier_mode(void) {
+    static bool inited = false;
+    static bool flag   = false;
+    if (!inited) {
+        // Monolith default: NO-OUTLIER unless RQ4_KEEP_OUTLIER is set.
+        flag   = (getenv("RQ4_KEEP_OUTLIER") == NULL);
+        inited = true;
+    }
+    return flag;
+}
+
+static inline uint8_t rq4_choose_index(float v) {
+    uint8_t idx = 0;
+    if (v > RQ4_BOUNDARIES[7]) {
+        idx = 8;
+        if (v > RQ4_BOUNDARIES[11]) {
+            if (v > RQ4_BOUNDARIES[13]) {
+                idx = (v > RQ4_BOUNDARIES[14]) ? 15u : 14u;
+            } else {
+                idx = (v > RQ4_BOUNDARIES[12]) ? 13u : 12u;
+            }
+        } else {
+            if (v > RQ4_BOUNDARIES[9]) {
+                idx = (v > RQ4_BOUNDARIES[10]) ? 11u : 10u;
+            } else {
+                idx = (v > RQ4_BOUNDARIES[8]) ? 9u : 8u;
+            }
+        }
+    } else {
+        if (v > RQ4_BOUNDARIES[3]) {
+            if (v > RQ4_BOUNDARIES[5]) {
+                idx = (v > RQ4_BOUNDARIES[6]) ? 7u : 6u;
+            } else {
+                idx = (v > RQ4_BOUNDARIES[4]) ? 5u : 4u;
+            }
+        } else {
+            if (v > RQ4_BOUNDARIES[1]) {
+                idx = (v > RQ4_BOUNDARIES[2]) ? 3u : 2u;
+            } else {
+                idx = (v > RQ4_BOUNDARIES[0]) ? 1u : 0u;
+            }
+        }
+    }
+    return idx;
+}
+
+static void rq4_rht_forward(const float * GGML_RESTRICT in, float * GGML_RESTRICT out) {
+    const float * signs = rq4_signs_ptr();
+    for (int i = 0; i < 32; i++) { out[i] = in[i] * signs[i]; }
+    for (int step = 1; step < 32; step <<= 1) {
+        for (int i = 0; i < 32; i += step << 1) {
+            for (int j = i; j < i + step; j++) {
+                float a = out[j], b = out[j + step];
+                out[j] = a + b; out[j + step] = a - b;
+            }
+        }
+    }
+    const float norm = 1.0f / sqrtf(32.0f);
+    for (int i = 0; i < 32; i++) { out[i] *= norm; }
+}
+
+static void rq4_rht_inverse(const float * GGML_RESTRICT in, float * GGML_RESTRICT out) {
+    for (int i = 0; i < 32; i++) { out[i] = in[i]; }
+    for (int step = 1; step < 32; step <<= 1) {
+        for (int i = 0; i < 32; i += step << 1) {
+            for (int j = i; j < i + step; j++) {
+                float a = out[j], b = out[j + step];
+                out[j] = a + b; out[j + step] = a - b;
+            }
+        }
+    }
+    const float norm = 1.0f / sqrtf(32.0f);
+    const float * signs = rq4_signs_ptr();
+    for (int i = 0; i < 32; i++) { out[i] *= norm * signs[i]; }
+}
+
+// Forward RHT helper: sign-flipped WHT for one sub-block
+static void rq4_subblock_quantize(const float * GGML_RESTRICT x, const float * GGML_RESTRICT weights,
+                                       uint8_t * GGML_RESTRICT L, float * GGML_RESTRICT the_min,
+                                       float rmin, float rdelta, int nstep) {
+    const int n = 32;
+    const int nmax = 15;
+    float rotated[n];
+    // Apply WHT to find best scale+min in rotated domain
+    rq4_rht_forward(x, rotated);
+    make_qkx2_quants(n, nmax, rotated, weights, L, the_min, NULL, rmin, rdelta, nstep, false);
+}
+
+// Method C (1-outlier sparse): WHT-rotated uniform 4-bit fit + sparse FP16 outlier
+// extraction. For each 32-element sub-block: compute sigma, take the 1 largest-
+// magnitude weight with |w|>3sigma (lane 31 reserved as sentinel, so skipped). Across
+// the 8 sub-blocks keep only the RQ4_OL_SLOTS=4 largest-magnitude candidates; zero
+// exactly those, forward-WHT the remaining inlier mass and fit uniform 4-bit levels
+// (make_qkx2_quants). With the rounded scale/min, reconstruct w_nat_hat via inverse-
+// WHT at each kept outlier lane and store ol_delta = w_orig - w_nat_hat (FP16). Decode
+// adds the delta at the outlier lane -> exact recovery up to FP16; the uniform fit no
+// longer allocates levels to heavy tails, so its error (and PPL) drops sharply.
+void quantize_row_rq4_ref(const float * GGML_RESTRICT x, block_rq4 * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_RQ4 == 0);
+    const int nb = k / QK_RQ4;
+    const int nsub = QK_RQ4/32;
+
+    uint8_t L[QK_RQ4];
+    uint8_t Laux[32];
+    float   weights[32];
+    float   mins  [QK_RQ4/32];
+    float   scales[QK_RQ4/32];
+    float   rot  [QK_RQ4];   // WHT-rotated sub-blocks (8 x 32) of the ZEROED-at-outliers vector
+
+    int   cand_lane[QK_RQ4/32];
+    float cand_mag [QK_RQ4/32];
+    bool  active   [QK_RQ4/32];
+
+    const bool no_outlier = rq4_no_outlier_mode();
+
+    for (int i = 0; i < nb; i++) {
+        float max_scale = 0;
+        float max_min = 0;
+
+        // No-outlier mode (RQ4_NO_OUTLIER set): skip candidate detection and the
+        // greedy selection entirely; every sub-block stays inactive => Pass 1
+        // forward-WHTs the FULL weights (no lane zeroed), Pass 2 writes no FP16
+        // deltas, and every ol_loc[slot] retains the 0x1F sentinel + 0 delta set
+        // below. Default (env unset) runs the existing outlier extraction.
+        for (int j = 0; j < nsub; ++j) active[j] = false;
+        if (!no_outlier) {
+            // Detect candidates: <=1 per sub-block (largest |w|>3sigma, lane!=31).
+            for (int j = 0; j < nsub; ++j) {
+                const float * xj = x + 32*j;
+                float mean = 0.0f;
+                for (int l = 0; l < 32; ++l) mean += xj[l];
+                mean /= 32.0f;
+                float var = 0.0f;
+                for (int l = 0; l < 32; ++l) { float dd = xj[l] - mean; var += dd*dd; }
+                var /= 32.0f;
+                const float sigma = sqrtf(var);
+
+                cand_lane[j] = -1; cand_mag[j] = -1.0f;
+                if (sigma > 0.0f) {
+                    const float thr = 3.0f*sigma;
+                    int bl = -1; float bmag = -1.0f;
+                    for (int l = 0; l < 32; ++l) {
+                        if (l == 31) continue;             // lane 31 reserved as sentinel
+                        const float a = fabsf(xj[l]);
+                        if (a > thr && a > bmag) { bmag = a; bl = l; }
+                    }
+                    cand_lane[j] = bl; cand_mag[j] = bmag;
+                }
+            }
+
+            // Keep the RQ4_OL_SLOTS largest-magnitude candidates (greedy; <=8 picks).
+            for (int s = 0; s < RQ4_OL_SLOTS; ++s) {
+                int best = -1; float bestm = -1.0f;
+                for (int j = 0; j < nsub; ++j) {
+                    if (!active[j] && cand_lane[j] >= 0 && cand_mag[j] > bestm) {
+                        bestm = cand_mag[j]; best = j;
+                    }
+                }
+                if (best < 0) break;
+                active[best] = true;
+            }
+        }
+
+        // Pass 1: per sub-block — zero the active outlier, forward-WHT, fit uniform.
+        for (int j = 0; j < nsub; ++j) {
+            const float * xj = x + 32*j;
+            float xz[32];
+            if (active[j]) {
+                const int cl = cand_lane[j];
+                for (int l = 0; l < 32; ++l) xz[l] = (l == cl) ? 0.0f : xj[l];
+            } else {
+                for (int l = 0; l < 32; ++l) xz[l] = xj[l];
+            }
+            rq4_rht_forward(xz, rot + 32*j);
+
+            float sum_x2 = 0;
+            for (int l = 0; l < 32; ++l) sum_x2 += rot[32*j + l] * rot[32*j + l];
+            float av_x = sqrtf(sum_x2/32);
+            for (int l = 0; l < 32; ++l) weights[l] = av_x + fabsf(rot[32*j + l]);
+            scales[j] = make_qkx2_quants(32, 15, rot + 32*j, weights, L + 32*j, &mins[j], Laux, -1.f, 0.1f, 20, false);
+            if (scales[j] > max_scale) max_scale = scales[j];
+            if (mins[j]   > max_min)   max_min   = mins[j];
+        }
+
+        float inv_scale = max_scale > 0 ? 63.f/max_scale : 0.f;
+        float inv_min   = max_min   > 0 ? 63.f/max_min   : 0.f;
+        for (int j = 0; j < nsub; ++j) {
+            uint8_t ls = nearest_int(inv_scale*scales[j]);
+            uint8_t lm = nearest_int(inv_min*mins[j]);
+            ls = MIN(63, ls);
+            lm = MIN(63, lm);
+            if (j < 4) {
+                y[i].scales[j]   = ls;
+                y[i].scales[j+4] = lm;
+            } else {
+                y[i].scales[j+4] = (ls & 0xF) | ((lm & 0xF) << 4);
+                y[i].scales[j-4] |= ((ls >> 4) << 6);
+                y[i].scales[j-0] |= ((lm >> 4) << 6);
+            }
+        }
+        y[i].d    = GGML_FP32_TO_FP16(max_scale/63.f);
+        y[i].dmin = GGML_FP32_TO_FP16(max_min/63.f);
+
+        // Pass 2: re-quantize with the rounded scale/min.
+        uint8_t sc, m;
+        for (int j = 0; j < nsub; ++j) {
+            get_scale_min_k4(j, y[i].scales, &sc, &m);
+            const float d1 = GGML_FP16_TO_FP32(y[i].d) * sc;
+            const float dm = GGML_FP16_TO_FP32(y[i].dmin) * m;
+            if (!d1) {
+                for (int ii = 0; ii < 32; ++ii) L[32*j + ii] = 0;
+            } else {
+                for (int ii = 0; ii < 32; ++ii) {
+                    int l = nearest_int((rot[32*j + ii] + dm)/d1);
+                    l = MAX(0, MIN(15, l));
+                    L[32*j + ii] = l;
+                }
+            }
+        }
+
+        // Pack 4-bit levels into qs (identical layout to block_q4_K).
+        uint8_t * q = y[i].qs;
+        for (int j = 0; j < QK_RQ4; j += 64) {
+            for (int l = 0; l < 32; ++l) q[l] = L[j + l] | (L[j + l + 32] << 4);
+            q += 32;
+        }
+
+        x += QK_RQ4;
+    }
+}
+
+void dequantize_row_rq4(const block_rq4 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_RQ4 == 0);
+    const int nb = k / QK_RQ4;
+
+    for (int i = 0; i < nb; i++) {
+        const float d   = GGML_FP16_TO_FP32(x[i].d);
+        const float min = GGML_FP16_TO_FP32(x[i].dmin);
+        const uint8_t * q = x[i].qs;
+
+        int is = 0;
+        uint8_t sc, m;
+        for (int j = 0; j < QK_RQ4; j += 64) {
+            get_scale_min_k4(is + 0, x[i].scales, &sc, &m);
+            const float d1 = d * sc; const float m1 = min * m;
+            get_scale_min_k4(is + 1, x[i].scales, &sc, &m);
+            const float d2 = d * sc; const float m2 = min * m;
+
+            // Q4_K-style uniform dequant in the WHT-rotated domain (d1*L - m1, with
+            // the min INSIDE the inverse WHT), then inverse-WHT to natural domain.
+            float sub0[32], sub1[32];
+            for (int l = 0; l < 32; ++l) {
+                sub0[l] = d1 * (q[l] & 0xF) - m1;
+                sub1[l] = d2 * (q[l] >> 4)  - m2;
+            }
+            rq4_rht_inverse(sub0, sub0);
+            rq4_rht_inverse(sub1, sub1);
+            for (int l = 0; l < 32; ++l) *y++ = sub0[l];
+            for (int l = 0; l < 32; ++l) *y++ = sub1[l];
+            q += 32; is += 2;
+        }
+    }
+}
+
+size_t quantize_rq4(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    (void) quant_weights;
+    assert(n_per_row % QK_RQ4 == 0);
+    const size_t row_size = ggml_row_size(GGML_TYPE_RQ4, n_per_row);
+    quantize_row_rq4_ref(src, dst, (int64_t) nrow * n_per_row);
+    return nrow * row_size;
+}
+
+// ===========================================================================
+//
+// TurboQuant RQ3: WHT rotation + 3-bit scale+min uniform fit (3.5 bpw)
+// The direct 3-bit analog of RQ4: same WHT math, same scale+min recipe via
+// make_qkx2_quants, but nmax=7 and a 3-bit (hmask bit2 + qs bits0-1) packing.
+//
+
+// Default sign pattern = the Phase-6 global coord-ascent winner (0.8B
+// wikitext-2, 64-chunk proxy). Beats the rand2 prior by 3.40 PPL (21.67 ->
+// 18.27) and Q3_K (19.80). Override at runtime via env RQ3_SIGNS (32× '+''-').
+const float RQ3_SIGNS[32] = {
+    -1.0f, -1.0f, +1.0f, +1.0f, -1.0f, +1.0f, -1.0f, +1.0f,
+    -1.0f, +1.0f, -1.0f, +1.0f, +1.0f, -1.0f, +1.0f, +1.0f,
+    +1.0f, +1.0f, -1.0f, -1.0f, -1.0f, -1.0f, +1.0f, +1.0f,
+    +1.0f, -1.0f, -1.0f, -1.0f, +1.0f, +1.0f, +1.0f, -1.0f,
+};
+
+// RQ3 sign-pattern parameterization (research sweep). Same mechanism as
+// rq4_signs_ptr: env RQ3_SIGNS = 32 chars '+'/'-'; default == golden literal.
+// Non-static: ggml-cpu/quants.c's ggml_vec_dot_rq3_f32 references it.
+const float * rq3_signs_ptr(void) {
+    static float cached[32];
+    static bool inited = false;
+    if (inited) return cached;
+    bool ok = false;
+    const char * env = getenv("RQ3_SIGNS");
+    if (env) {
+        size_t n = 0;
+        while (env[n] && n <= 32) ++n;
+        if (n == 32) {
+            ok = true;
+            for (int i = 0; i < 32; ++i) {
+                if      (env[i] == '+') cached[i] = +1.0f;
+                else if (env[i] == '-') cached[i] = -1.0f;
+                else { ok = false; break; }
+            }
+        }
+    }
+    if (!ok) memcpy(cached, RQ3_SIGNS, sizeof(RQ3_SIGNS));
+    inited = true;
+    return cached;
+}
+
+// Forward/inverse randomized Hadamard transform — byte-identical bodies to the
+// RQ4 versions, reading the independent rq3_signs_ptr() source.
+static void rq3_rht_forward(const float * GGML_RESTRICT in, float * GGML_RESTRICT out) {
+    const float * signs = rq3_signs_ptr();
+    for (int i = 0; i < 32; i++) { out[i] = in[i] * signs[i]; }
+    for (int step = 1; step < 32; step <<= 1) {
+        for (int i = 0; i < 32; i += step << 1) {
+            for (int j = i; j < i + step; j++) {
+                float a = out[j], b = out[j + step];
+                out[j] = a + b; out[j + step] = a - b;
+            }
+        }
+    }
+    const float norm = 1.0f / sqrtf(32.0f);
+    for (int i = 0; i < 32; i++) { out[i] *= norm; }
+}
+
+static void rq3_rht_inverse(const float * GGML_RESTRICT in, float * GGML_RESTRICT out) {
+    for (int i = 0; i < 32; i++) { out[i] = in[i]; }
+    for (int step = 1; step < 32; step <<= 1) {
+        for (int i = 0; i < 32; i += step << 1) {
+            for (int j = i; j < i + step; j++) {
+                float a = out[j], b = out[j + step];
+                out[j] = a + b; out[j + step] = a - b;
+            }
+        }
+    }
+    const float norm = 1.0f / sqrtf(32.0f);
+    const float * signs = rq3_signs_ptr();
+    for (int i = 0; i < 32; i++) { out[i] *= norm * signs[i]; }
+}
+
+// 3-bit level extraction helpers. Level L in 0..7 for weight i (within a
+// superblock): bits 0-1 in qs[i/4] (shift 2*(i%4)), bit 2 in hmask[i/8]
+// (shift i%8). Inverse of the packing in quantize_row_rq3_ref.
+static inline uint8_t rq3_get_level(int i, const uint8_t * GGML_RESTRICT qs, const uint8_t * GGML_RESTRICT hmask) {
+    const uint8_t lo = (qs[i/4] >> (2*(i & 3))) & 3;
+    const uint8_t hi = (hmask[i/8] >> (i & 7)) & 1;
+    return lo | (hi << 2);
+}
+
+void quantize_row_rq3_ref(const float * GGML_RESTRICT x, block_rq3 * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_RQ3 == 0);
+    const int nb = k / QK_RQ3;
+    const int nsub = QK_RQ3/32;
+
+    uint8_t L[QK_RQ3];
+    uint8_t Laux[32];
+    float   weights[32];
+    float   mins  [QK_RQ3/32];
+    float   scales[QK_RQ3/32];
+    float   rot  [QK_RQ3];   // WHT-rotated sub-blocks (8 x 32)
+
+    for (int i = 0; i < nb; i++) {
+        float max_scale = 0;
+        float max_min = 0;
+
+        // Pass 1: per sub-block — forward-WHT, fit uniform 3-bit (nmax=7).
+        for (int j = 0; j < nsub; ++j) {
+            rq3_rht_forward(x + 32*j, rot + 32*j);
+
+            float sum_x2 = 0;
+            for (int l = 0; l < 32; ++l) sum_x2 += rot[32*j + l] * rot[32*j + l];
+            float av_x = sqrtf(sum_x2/32);
+            for (int l = 0; l < 32; ++l) weights[l] = av_x + fabsf(rot[32*j + l]);
+            scales[j] = make_qkx2_quants(32, 7, rot + 32*j, weights, L + 32*j, &mins[j], Laux, -1.f, 0.1f, 20, false);
+            if (scales[j] > max_scale) max_scale = scales[j];
+            if (mins[j]   > max_min)   max_min   = mins[j];
+        }
+
+        float inv_scale = max_scale > 0 ? 63.f/max_scale : 0.f;
+        float inv_min   = max_min   > 0 ? 63.f/max_min   : 0.f;
+        for (int j = 0; j < nsub; ++j) {
+            uint8_t ls = nearest_int(inv_scale*scales[j]);
+            uint8_t lm = nearest_int(inv_min*mins[j]);
+            ls = MIN(63, ls);
+            lm = MIN(63, lm);
+            if (j < 4) {
+                y[i].scales[j]   = ls;
+                y[i].scales[j+4] = lm;
+            } else {
+                y[i].scales[j+4] = (ls & 0xF) | ((lm & 0xF) << 4);
+                y[i].scales[j-4] |= ((ls >> 4) << 6);
+                y[i].scales[j-0] |= ((lm >> 4) << 6);
+            }
+        }
+        y[i].d    = GGML_FP32_TO_FP16(max_scale/63.f);
+        y[i].dmin = GGML_FP32_TO_FP16(max_min/63.f);
+
+        // Pass 2: re-quantize with the rounded scale/min (clamp to 0..7).
+        uint8_t sc, m;
+        for (int j = 0; j < nsub; ++j) {
+            get_scale_min_k4(j, y[i].scales, &sc, &m);
+            const float d1 = GGML_FP16_TO_FP32(y[i].d) * sc;
+            const float dm = GGML_FP16_TO_FP32(y[i].dmin) * m;
+            if (!d1) {
+                for (int ii = 0; ii < 32; ++ii) L[32*j + ii] = 0;
+            } else {
+                for (int ii = 0; ii < 32; ++ii) {
+                    int l = nearest_int((rot[32*j + ii] + dm)/d1);
+                    l = MAX(0, MIN(7, l));
+                    L[32*j + ii] = l;
+                }
+            }
+        }
+
+        // Pack 3-bit levels into hmask (bit 2) + qs (bits 0-1). Bitwise OR =>
+        // clear both fields first.
+        memset(y[i].qs,    0, sizeof(y[i].qs));
+        memset(y[i].hmask, 0, sizeof(y[i].hmask));
+        for (int ii = 0; ii < QK_RQ3; ++ii) {
+            const uint8_t lvl = L[ii];
+            y[i].qs[ii/4]    |= (lvl & 3) << (2*(ii & 3));
+            y[i].hmask[ii/8] |= ((lvl >> 2) & 1) << (ii & 7);
+        }
+
+        x += QK_RQ3;
+    }
+}
+
+void dequantize_row_rq3(const block_rq3 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_RQ3 == 0);
+    const int nb = k / QK_RQ3;
+
+    for (int i = 0; i < nb; i++) {
+        const float d   = GGML_FP16_TO_FP32(x[i].d);
+        const float min = GGML_FP16_TO_FP32(x[i].dmin);
+        const uint8_t * qs    = x[i].qs;
+        const uint8_t * hmask = x[i].hmask;
+
+        uint8_t sc, m;
+        int is = 0;
+        for (int j = 0; j < QK_RQ3; j += 32) {
+            get_scale_min_k4(is, x[i].scales, &sc, &m);
+            const float d1 = d * sc; const float m1 = min * m;
+            float sub[32];
+            for (int l = 0; l < 32; ++l) {
+                const uint8_t lvl = rq3_get_level(j + l, qs, hmask);
+                sub[l] = d1 * lvl - m1;
+            }
+            rq3_rht_inverse(sub, sub);
+            for (int l = 0; l < 32; ++l) *y++ = sub[l];
+            ++is;
+        }
+    }
+}
+
+size_t quantize_rq3(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    (void) quant_weights;
+    assert(n_per_row % QK_RQ3 == 0);
+    const size_t row_size = ggml_row_size(GGML_TYPE_RQ3, n_per_row);
+    quantize_row_rq3_ref(src, dst, (int64_t) nrow * n_per_row);
+    return nrow * row_size;
+}
+
+// TurboQuant RQ2: WHT rotation + 2-bit scale+min uniform fit (2.5 bpw).
+// The 2-bit analog of RQ3: same WHT math, same scale+min recipe via
+// make_qkx2_quants, but nmax=3 and a pure 2-bit packing (no hmask).
+
+// Default sign pattern = the RQ2 sign-search WINNER (0.8B proxy: PPL 74.58 -> 53.44, -21.1). Override at
+// runtime via env RQ2_SIGNS (32x '+''-'). Must match the CUDA rq2_signs_dev default.
+const float RQ2_SIGNS[32] = {
+    -1.0f, +1.0f, -1.0f, -1.0f, -1.0f, +1.0f, -1.0f, +1.0f,
+    -1.0f, +1.0f, -1.0f, +1.0f, +1.0f, -1.0f, +1.0f, +1.0f,
+    +1.0f, +1.0f, -1.0f, -1.0f, -1.0f, -1.0f, +1.0f, +1.0f,
+    +1.0f, -1.0f, -1.0f, -1.0f, +1.0f, +1.0f, +1.0f, -1.0f,
+};
+
+// RQ2 sign-pattern parameterization (sign-search sweep). Same mechanism as
+// rq3_signs_ptr: env RQ2_SIGNS = 32 chars '+'/'-'; default == golden literal.
+// Non-static: ggml-cpu/quants.c's ggml_vec_dot_rq2_f32 references it.
+const float * rq2_signs_ptr(void) {
+    static float cached[32];
+    static bool inited = false;
+    if (inited) return cached;
+    bool ok = false;
+    const char * env = getenv("RQ2_SIGNS");
+    if (env) {
+        size_t n = 0;
+        while (env[n] && n <= 32) ++n;
+        if (n == 32) {
+            ok = true;
+            for (int i = 0; i < 32; ++i) {
+                if      (env[i] == '+') cached[i] = +1.0f;
+                else if (env[i] == '-') cached[i] = -1.0f;
+                else { ok = false; break; }
+            }
+        }
+    }
+    if (!ok) memcpy(cached, RQ2_SIGNS, sizeof(RQ2_SIGNS));
+    inited = true;
+    return cached;
+}
+
+// Forward/inverse randomized Hadamard transform -- byte-identical bodies to the
+// rq3 versions, reading the independent rq2_signs_ptr() source.
+static void rq2_rht_forward(const float * GGML_RESTRICT in, float * GGML_RESTRICT out) {
+    const float * signs = rq2_signs_ptr();
+    for (int i = 0; i < 32; i++) { out[i] = in[i] * signs[i]; }
+    for (int step = 1; step < 32; step <<= 1) {
+        for (int i = 0; i < 32; i += step << 1) {
+            for (int j = i; j < i + step; j++) {
+                float a = out[j], b = out[j + step];
+                out[j] = a + b; out[j + step] = a - b;
+            }
+        }
+    }
+    const float norm = 1.0f / sqrtf(32.0f);
+    for (int i = 0; i < 32; i++) { out[i] *= norm; }
+}
+
+static void rq2_rht_inverse(const float * GGML_RESTRICT in, float * GGML_RESTRICT out) {
+    for (int i = 0; i < 32; i++) { out[i] = in[i]; }
+    for (int step = 1; step < 32; step <<= 1) {
+        for (int i = 0; i < 32; i += step << 1) {
+            for (int j = i; j < i + step; j++) {
+                float a = out[j], b = out[j + step];
+                out[j] = a + b; out[j + step] = a - b;
+            }
+        }
+    }
+    const float norm = 1.0f / sqrtf(32.0f);
+    const float * signs = rq2_signs_ptr();
+    for (int i = 0; i < 32; i++) { out[i] *= norm * signs[i]; }
+}
+
+// 2-bit level extraction. Level L in 0..3 for weight i (within a superblock):
+// bits 0-1 in qs[i/4] (shift 2*(i%4)). No hmask. Inverse of the packing in
+// quantize_row_rq2_ref.
+static inline uint8_t rq2_get_level(int i, const uint8_t * GGML_RESTRICT qs) {
+    return (qs[i/4] >> (2*(i & 3))) & 3;
+}
+
+void quantize_row_rq2_ref(const float * GGML_RESTRICT x, block_rq2 * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_RQ2 == 0);
+    const int nb = k / QK_RQ2;
+    const int nsub = QK_RQ2/32;
+
+    uint8_t L[QK_RQ2];
+    uint8_t Laux[32];
+    float   weights[32];
+    float   mins  [QK_RQ2/32];
+    float   scales[QK_RQ2/32];
+    float   rot  [QK_RQ2];   // WHT-rotated sub-blocks (8 x 32)
+
+    for (int i = 0; i < nb; i++) {
+        float max_scale = 0;
+        float max_min = 0;
+
+        // Pass 1: per sub-block -- forward-WHT, fit uniform 2-bit (nmax=3).
+        for (int j = 0; j < nsub; ++j) {
+            rq2_rht_forward(x + 32*j, rot + 32*j);
+
+            float sum_x2 = 0;
+            for (int l = 0; l < 32; ++l) sum_x2 += rot[32*j + l] * rot[32*j + l];
+            float av_x = sqrtf(sum_x2/32);
+            for (int l = 0; l < 32; ++l) weights[l] = av_x + fabsf(rot[32*j + l]);
+            scales[j] = make_qkx2_quants(32, 3, rot + 32*j, weights, L + 32*j, &mins[j], Laux, -1.f, 0.1f, 20, false);
+            if (scales[j] > max_scale) max_scale = scales[j];
+            if (mins[j]   > max_min)   max_min   = mins[j];
+        }
+
+        float inv_scale = max_scale > 0 ? 63.f/max_scale : 0.f;
+        float inv_min   = max_min   > 0 ? 63.f/max_min   : 0.f;
+        for (int j = 0; j < nsub; ++j) {
+            uint8_t ls = nearest_int(inv_scale*scales[j]);
+            uint8_t lm = nearest_int(inv_min*mins[j]);
+            ls = MIN(63, ls);
+            lm = MIN(63, lm);
+            if (j < 4) {
+                y[i].scales[j]   = ls;
+                y[i].scales[j+4] = lm;
+            } else {
+                y[i].scales[j+4] = (ls & 0xF) | ((lm & 0xF) << 4);
+                y[i].scales[j-4] |= ((ls >> 4) << 6);
+                y[i].scales[j-0] |= ((lm >> 4) << 6);
+            }
+        }
+        y[i].d    = GGML_FP32_TO_FP16(max_scale/63.f);
+        y[i].dmin = GGML_FP32_TO_FP16(max_min/63.f);
+
+        // Pass 2: re-quantize with the rounded scale/min (clamp to 0..3).
+        uint8_t sc, m;
+        for (int j = 0; j < nsub; ++j) {
+            get_scale_min_k4(j, y[i].scales, &sc, &m);
+            const float d1 = GGML_FP16_TO_FP32(y[i].d) * sc;
+            const float dm = GGML_FP16_TO_FP32(y[i].dmin) * m;
+            if (!d1) {
+                for (int ii = 0; ii < 32; ++ii) L[32*j + ii] = 0;
+            } else {
+                for (int ii = 0; ii < 32; ++ii) {
+                    int l = nearest_int((rot[32*j + ii] + dm)/d1);
+                    l = MAX(0, MIN(3, l));
+                    L[32*j + ii] = l;
+                }
+            }
+        }
+
+        // Pack 2-bit levels into qs (4 levels/byte). Bitwise OR => clear first.
+        memset(y[i].qs, 0, sizeof(y[i].qs));
+        for (int ii = 0; ii < QK_RQ2; ++ii) {
+            const uint8_t lvl = L[ii];
+            y[i].qs[ii/4] |= lvl << (2*(ii & 3));
+        }
+
+        x += QK_RQ2;
+    }
+}
+
+void dequantize_row_rq2(const block_rq2 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_RQ2 == 0);
+    const int nb = k / QK_RQ2;
+
+    for (int i = 0; i < nb; i++) {
+        const float d   = GGML_FP16_TO_FP32(x[i].d);
+        const float min = GGML_FP16_TO_FP32(x[i].dmin);
+        const uint8_t * qs = x[i].qs;
+
+        uint8_t sc, m;
+        int is = 0;
+        for (int j = 0; j < QK_RQ2; j += 32) {
+            get_scale_min_k4(is, x[i].scales, &sc, &m);
+            const float d1 = d * sc; const float m1 = min * m;
+            float sub[32];
+            for (int l = 0; l < 32; ++l) {
+                const uint8_t lvl = rq2_get_level(j + l, qs);
+                sub[l] = d1 * lvl - m1;
+            }
+            rq2_rht_inverse(sub, sub);
+            for (int l = 0; l < 32; ++l) *y++ = sub[l];
+            ++is;
+        }
+    }
+}
+
+size_t quantize_rq2(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    (void) quant_weights;
+    assert(n_per_row % QK_RQ2 == 0);
+    const size_t row_size = ggml_row_size(GGML_TYPE_RQ2, n_per_row);
+    quantize_row_rq2_ref(src, dst, (int64_t) nrow * n_per_row);
+    return nrow * row_size;
+}
+

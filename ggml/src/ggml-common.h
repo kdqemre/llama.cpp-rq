@@ -337,6 +337,84 @@ typedef struct {
 } block_q4_K;
 static_assert(sizeof(block_q4_K) == 2*sizeof(ggml_half) + K_SCALE_SIZE + QK_K/2, "wrong q4_K block size/padding");
 
+// Rotated Quant 4-bit Large: 256-element superblock, WHT-rotated uniform 4-bit fit.
+// 8 sub-blocks of 32 elements, per-subblock scale+min (6-bit).
+// Method C (1-outlier sparse): at most 1 heavy-tail outlier per 32-el sub-block is
+// extracted (stored exactly) so the uniform 4-bit fit runs on the inlier mass; the
+// outlier is patched back at decode. weight = d*sc*L - dmin*m (rotated domain) ->
+// inverse WHT, then the outlier lane is corrected by ol_delta.
+//
+// Sparse FP16 outlier storage (156 B = 4.875 bpw). Across the 8 sub-blocks the
+// quantizer selects <=1 outlier each (largest |w|>3sigma, lane!=31) and keeps only
+// the RQ4_OL_SLOTS=4 largest-magnitude ones; the rest stay in the uniform fit. The
+// block reserves a FIXED 4 slots (branch-light decode) but on average far fewer are
+// active, so the budget is the reservation, not the population.
+//   ol_loc [s]   : (sub_block<<5)|lane for slot s. lane==31 (low 5 bits == 0x1F) is
+//                  the empty sentinel; lane 31 is reserved and never selected, so any
+//                  active slot has lane in 0..30 and a distinct sub_block.
+//   ol_delta[s]  : FP16 delta = w_orig - w_nat_hat at that lane (natural domain).
+//                  Decode: w_nat_hat += ol_delta on the matching lane reconstructs the
+//                  original weight exactly up to FP16 (no int8/dscale quantization loss).
+#define QK_RQ4 QK_K
+#define RQ4_OL_SLOTS 4                // reserved outlier slots per superblock (<=8 sub-blocks)
+typedef struct {
+    GGML_EXTENSION union {
+        struct {
+            ggml_half d;    // super-block scale for quantized scales
+            ggml_half dmin; // super-block scale for quantized mins
+        } GGML_COMMON_AGGR_S;
+        ggml_half2 dm;
+    } GGML_COMMON_AGGR_U;
+    uint8_t scales[K_SCALE_SIZE];              // 12 bytes: 8×6-bit sub-block scales + 8×6-bit mins
+    uint8_t qs[QK_RQ4 / 2];                // 128 bytes: 256×4-bit uniform levels (WHT-rotated domain)
+} block_rq4;
+// 4 + 12 + 128 = 144 bytes (4.5 bpw); byte-identical layout to block_q4_K. No-outlier Repo B: the
+// ol_loc/ol_delta tail was dropped (it was sentinel-dead here). 16-byte aligned.
+static_assert(sizeof(block_rq4) == 2*sizeof(ggml_half) + K_SCALE_SIZE + QK_RQ4/2,
+              "wrong rq4 block size/padding");
+
+// Rotated Quant 3-bit Large: 256-element superblock, WHT-rotated uniform 3-bit fit.
+// 8 sub-blocks of 32 elements, per-subblock scale+min (6-bit) via get_scale_min_k4.
+// weight = d*sc*L - dmin*m (rotated domain, L in 0..7) -> inverse WHT to natural domain.
+// 3-bit level L for weight i: bits 0-1 in qs[i/4] (shift 2*(i%4)), bit 2 in hmask[i/8]
+// (shift i%8). Mirrors block_rq4's scale+min recipe at nmax=7.
+#define QK_RQ3 QK_K
+typedef struct {
+    GGML_EXTENSION union {
+        struct {
+            ggml_half d;    // super-block scale for quantized scales
+            ggml_half dmin; // super-block scale for quantized mins
+        } GGML_COMMON_AGGR_S;
+        ggml_half2 dm;
+    } GGML_COMMON_AGGR_U;
+    uint8_t scales[K_SCALE_SIZE];              // 12 bytes: 8×6-bit sub-block scales + 8×6-bit mins
+    uint8_t hmask[QK_RQ3 / 8];                 // 32 bytes: bit 2 of each 3-bit level (flat)
+    uint8_t qs[QK_RQ3 / 4];                    // 64 bytes: bits 0-1 of each 3-bit level (flat)
+} block_rq3;
+// 4 + 12 + 32 + 64 = 112 bytes (3.5 bpw). 16-byte aligned.
+static_assert(sizeof(block_rq3) == 2*sizeof(ggml_half) + K_SCALE_SIZE + QK_RQ3/8 + QK_RQ3/4,
+              "wrong rq3 block size/padding");
+// Rotated Quant 2-bit Large: 256-element superblock, WHT-rotated uniform 2-bit fit.
+// 8 sub-blocks of 32 elements, per-subblock scale+min (6-bit) via get_scale_min_k4.
+// weight = d*sc*L - dmin*m (rotated domain, L in 0..3) -> inverse WHT to natural domain.
+// 2-bit level L for weight i: bits 0-1 in qs[i/4] (shift 2*(i%4)). No high-bit mask
+// (only 4 levels, fits 2 bits). Mirrors block_rq4/block_rq3's scale+min recipe at nmax=3.
+#define QK_RQ2 QK_K
+typedef struct {
+    GGML_EXTENSION union {
+        struct {
+            ggml_half d;    // super-block scale for quantized scales
+            ggml_half dmin; // super-block scale for quantized mins
+        } GGML_COMMON_AGGR_S;
+        ggml_half2 dm;
+    } GGML_COMMON_AGGR_U;
+    uint8_t scales[K_SCALE_SIZE];              // 12 bytes: 8×6-bit sub-block scales + 8×6-bit mins
+    uint8_t qs[QK_RQ2 / 4];                    // 64 bytes: 256×2-bit levels (WHT-rotated domain)
+} block_rq2;
+// 4 + 12 + 64 = 80 bytes (2.5 bpw). 16-byte aligned.
+static_assert(sizeof(block_rq2) == 2*sizeof(ggml_half) + K_SCALE_SIZE + QK_RQ2/4,
+              "wrong rq2 block size/padding");
+
 // 5-bit quantization
 // 8 blocks of 32 elements each
 // weight is represented as x = a * q + b

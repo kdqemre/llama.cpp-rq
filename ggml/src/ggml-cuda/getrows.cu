@@ -1,6 +1,280 @@
 #include "getrows.cuh"
 #include "dequantize.cuh"
 #include "convert.cuh"
+#include "rq4-signs.cuh"
+#include "rq3-signs.cuh"
+#include "rq2-signs.cuh"
+
+__constant__ static const float rq4_centroids_getrows_cuda[16] = {
+    -2.732127f, -2.068495f, -1.617513f, -1.255729f,
+    -0.941906f, -0.656424f, -0.387837f, -0.128323f,
+     0.128323f,  0.387837f,  0.656424f,  0.941906f,
+     1.255729f,  1.617513f,  2.068495f,  2.732127f
+};
+// RQ4 sign pattern now comes from ggml_cuda_rq4_signs_dev (rq4-signs.cuh),
+// parameterized by the RQ4_SIGNS env var with a byte-identical golden default.
+
+// RQ4 get_rows CUDA kernel: 256-element superblock, 32 lanes/warp, WHT per sub-block.
+// OCCUPANCY: pack SUPERBLOCKS_PER_BLOCK (=8) superblocks per block, one warp each.
+template <typename dst_t>
+static __global__ void k_get_rows_rq4(
+        const block_rq4 * __restrict__ src0, const int32_t * __restrict__ src1, dst_t * __restrict__ dst,
+        const int64_t ne00, const int64_t ne11, const int64_t ne12,
+        const size_t s1, const size_t s2, const size_t s3,
+        const size_t nb01, const size_t nb02, const size_t nb03,
+        const size_t s10, const size_t s11, const size_t s12) {
+    constexpr int SUPERBLOCKS_PER_BLOCK = 8;  // == blockDim.y; one warp per superblock
+    const int lane = threadIdx.x;             // 0..31, one element per lane
+    const int spw  = threadIdx.y;             // 0..7, which superblock within this block
+    const int64_t z = blockIdx.z;
+
+    if (z >= ne11*ne12) { return; }
+    const int64_t nblocks = ne00 / QK_RQ4;
+    const int64_t b = (int64_t) blockIdx.y * SUPERBLOCKS_PER_BLOCK + spw;  // recomputed superblock index
+    if (b >= nblocks) { return; }
+
+    const int i10 = blockIdx.x;
+    const int i11 = z / ne12;
+    const int i12 = z % ne12;
+    const int i01 = src1[i10*s10 + i11*s11 + i12*s12];
+    const char * src0_row = (const char *) src0 + i01*nb01 + i11*nb02 + i12*nb03;
+    const block_rq4 * x = (const block_rq4 *) src0_row + b;
+    dst_t * dst_row = dst + i10*s1 + i11*s2 + i12*s3;
+
+    const float d   = __low2float(x->dm);
+    const float dmin = __high2float(x->dm);
+
+    // Per-warp scratch so the SUPERBLOCKS_PER_BLOCK warps never clobber each other.
+    __shared__ float shbuf[SUPERBLOCKS_PER_BLOCK * 32];
+    float * sb = shbuf + spw * 32;
+
+    for (int sp = 0; sp < 4; sp++) {
+        const int il = sp;
+        const int is = 2 * sp;
+        const uint8_t * q = x->qs + 32 * il;
+
+        uint8_t sc, m;
+        get_scale_min_k4(is + 0, x->scales, sc, m);
+        const float d1 = d * sc; const float m1 = dmin * m;
+        get_scale_min_k4(is + 1, x->scales, sc, m);
+        const float d2 = d * sc; const float m2 = dmin * m;
+
+        // Low nibble → sub-block is
+        // Uniform dequant in rotated domain (d1*L - m1, min INSIDE inverse WHT).
+        sb[lane] = d1 * (q[lane] & 0xF) - m1;
+        __syncthreads();
+        float val = sb[lane];
+        for (int step = 1; step < 32; step <<= 1) {
+            float other = __shfl_xor_sync(0xFFFFFFFF, val, step, 32);
+            val = (lane & step) ? (other - val) : (other + val);
+        }
+        val = val * (ggml_cuda_rq4_signs_dev[lane] / sqrtf(32.0f));
+        dst_row[b * QK_RQ4 + 64*il + lane] = ggml_cuda_cast<dst_t>(val);
+
+        // High nibble → sub-block is+1
+        __syncthreads();
+        sb[lane] = d2 * (q[lane] >> 4) - m2;
+        __syncthreads();
+        val = sb[lane];
+        for (int step = 1; step < 32; step <<= 1) {
+            float other = __shfl_xor_sync(0xFFFFFFFF, val, step, 32);
+            val = (lane & step) ? (other - val) : (other + val);
+        }
+        val = val * (ggml_cuda_rq4_signs_dev[lane] / sqrtf(32.0f));
+        dst_row[b * QK_RQ4 + 64*il + 32 + lane] = ggml_cuda_cast<dst_t>(val);
+    }
+}
+
+template <typename dst_t>
+static void get_rows_cuda_rq4(
+        const void * src0_d, const int32_t * src1_d, dst_t * dst_d,
+        const int64_t ne00, const size_t nb01, const size_t nb02, const size_t nb03,
+        const int64_t ne10, const int64_t ne11, const int64_t ne12, const size_t nb10, const size_t nb11, const size_t nb12,
+        const size_t nb1, const size_t nb2, const size_t nb3,
+        cudaStream_t stream) {
+    GGML_ASSERT(ne00 % QK_RQ4 == 0);
+    ggml_cuda_rq4_init_signs();
+    constexpr int SUPERBLOCKS_PER_BLOCK = 8;  // 8 warps/block, 256 threads total
+    const int64_t nblocks = ne00 / QK_RQ4;
+    const dim3 block_dims(32, SUPERBLOCKS_PER_BLOCK, 1);
+    const dim3 block_nums(ne10, (nblocks + SUPERBLOCKS_PER_BLOCK - 1) / SUPERBLOCKS_PER_BLOCK,
+                          MIN(ne11*ne12, (int64_t) UINT16_MAX));
+    const size_t st1 = nb1 / sizeof(dst_t);
+    const size_t st2 = nb2 / sizeof(dst_t);
+    const size_t st3 = nb3 / sizeof(dst_t);
+    const size_t st10 = nb10 / sizeof(int32_t);
+    const size_t st11 = nb11 / sizeof(int32_t);
+    const size_t st12 = nb12 / sizeof(int32_t);
+    k_get_rows_rq4<<<block_nums, block_dims, 0, stream>>>(
+        (const block_rq4 *) src0_d, src1_d, dst_d,
+        ne00, ne11, ne12,
+        st1, st2, st3,
+        nb01, nb02, nb03,
+        st10, st11, st12);
+}
+
+// RQ3 get_rows CUDA kernel: 256-element superblock, 32 lanes/warp, WHT per sub-block.
+// 8 sub-blocks of 32; 3-bit level extraction (bits 0-1 in qs, bit 2 in hmask).
+template <typename dst_t>
+static __global__ void k_get_rows_rq3(
+        const block_rq3 * __restrict__ src0, const int32_t * __restrict__ src1, dst_t * __restrict__ dst,
+        const int64_t ne00, const int64_t ne11, const int64_t ne12,
+        const size_t s1, const size_t s2, const size_t s3,
+        const size_t nb01, const size_t nb02, const size_t nb03,
+        const size_t s10, const size_t s11, const size_t s12) {
+    constexpr int SUPERBLOCKS_PER_BLOCK = 8;
+    const int lane = threadIdx.x;
+    const int spw  = threadIdx.y;
+    const int64_t z = blockIdx.z;
+
+    if (z >= ne11*ne12) { return; }
+    const int64_t nblocks = ne00 / QK_RQ3;
+    const int64_t b = (int64_t) blockIdx.y * SUPERBLOCKS_PER_BLOCK + spw;
+    if (b >= nblocks) { return; }
+
+    const int i10 = blockIdx.x;
+    const int i11 = z / ne12;
+    const int i12 = z % ne12;
+    const int i01 = src1[i10*s10 + i11*s11 + i12*s12];
+    const char * src0_row = (const char *) src0 + i01*nb01 + i11*nb02 + i12*nb03;
+    const block_rq3 * x = (const block_rq3 *) src0_row + b;
+    dst_t * dst_row = dst + i10*s1 + i11*s2 + i12*s3;
+
+    const float d   = __low2float(x->dm);
+    const float dmin = __high2float(x->dm);
+
+    __shared__ float shbuf[SUPERBLOCKS_PER_BLOCK * 32];
+    float * sb = shbuf + spw * 32;
+
+    for (int sp = 0; sp < 8; sp++) {
+        const int is = sp;
+        uint8_t sc, m;
+        get_scale_min_k4(is, x->scales, sc, m);
+        const float d1 = d * sc; const float m1 = dmin * m;
+
+        const int gi = 32*sp + lane;
+        const uint8_t lo = (x->qs[gi/4] >> (2*(gi & 3))) & 3;
+        const uint8_t hi = (x->hmask[gi/8] >> (gi & 7)) & 1;
+        const uint8_t L = lo | (hi << 2);
+        sb[lane] = d1 * L - m1;
+        __syncthreads();
+        float val = sb[lane];
+        for (int step = 1; step < 32; step <<= 1) {
+            float other = __shfl_xor_sync(0xFFFFFFFF, val, step, 32);
+            val = (lane & step) ? (other - val) : (other + val);
+        }
+        val = val * (ggml_cuda_rq3_signs_dev[lane] / sqrtf(32.0f));
+        dst_row[b * QK_RQ3 + 32*sp + lane] = ggml_cuda_cast<dst_t>(val);
+    }
+}
+
+template <typename dst_t>
+static void get_rows_cuda_rq3(
+        const void * src0_d, const int32_t * src1_d, dst_t * dst_d,
+        const int64_t ne00, const size_t nb01, const size_t nb02, const size_t nb03,
+        const int64_t ne10, const int64_t ne11, const int64_t ne12, const size_t nb10, const size_t nb11, const size_t nb12,
+        const size_t nb1, const size_t nb2, const size_t nb3,
+        cudaStream_t stream) {
+    GGML_ASSERT(ne00 % QK_RQ3 == 0);
+    ggml_cuda_rq3_init_signs();
+    constexpr int SUPERBLOCKS_PER_BLOCK = 8;
+    const int64_t nblocks = ne00 / QK_RQ3;
+    const dim3 block_dims(32, SUPERBLOCKS_PER_BLOCK, 1);
+    const dim3 block_nums(ne10, (nblocks + SUPERBLOCKS_PER_BLOCK - 1) / SUPERBLOCKS_PER_BLOCK,
+                          MIN(ne11*ne12, (int64_t) UINT16_MAX));
+    const size_t st1 = nb1 / sizeof(dst_t);
+    const size_t st2 = nb2 / sizeof(dst_t);
+    const size_t st3 = nb3 / sizeof(dst_t);
+    const size_t st10 = nb10 / sizeof(int32_t);
+    const size_t st11 = nb11 / sizeof(int32_t);
+    const size_t st12 = nb12 / sizeof(int32_t);
+    k_get_rows_rq3<<<block_nums, block_dims, 0, stream>>>(
+        (const block_rq3 *) src0_d, src1_d, dst_d,
+        ne00, ne11, ne12,
+        st1, st2, st3,
+        nb01, nb02, nb03,
+        st10, st11, st12);
+}
+// RQ2 get_rows CUDA kernel: 256-element superblock, 32 lanes/warp, WHT per sub-block.
+// 8 sub-blocks of 32; 2-bit level extraction (bits 0-1 in qs). No hmask.
+template <typename dst_t>
+static __global__ void k_get_rows_rq2(
+        const block_rq2 * __restrict__ src0, const int32_t * __restrict__ src1, dst_t * __restrict__ dst,
+        const int64_t ne00, const int64_t ne11, const int64_t ne12,
+        const size_t s1, const size_t s2, const size_t s3,
+        const size_t nb01, const size_t nb02, const size_t nb03,
+        const size_t s10, const size_t s11, const size_t s12) {
+    constexpr int SUPERBLOCKS_PER_BLOCK = 8;
+    const int lane = threadIdx.x;
+    const int spw  = threadIdx.y;
+    const int64_t z = blockIdx.z;
+
+    if (z >= ne11*ne12) { return; }
+    const int64_t nblocks = ne00 / QK_RQ2;
+    const int64_t b = (int64_t) blockIdx.y * SUPERBLOCKS_PER_BLOCK + spw;
+    if (b >= nblocks) { return; }
+
+    const int i10 = blockIdx.x;
+    const int i11 = z / ne12;
+    const int i12 = z % ne12;
+    const int i01 = src1[i10*s10 + i11*s11 + i12*s12];
+    const char * src0_row = (const char *) src0 + i01*nb01 + i11*nb02 + i12*nb03;
+    const block_rq2 * x = (const block_rq2 *) src0_row + b;
+    dst_t * dst_row = dst + i10*s1 + i11*s2 + i12*s3;
+
+    const float d   = __low2float(x->dm);
+    const float dmin = __high2float(x->dm);
+
+    __shared__ float shbuf[SUPERBLOCKS_PER_BLOCK * 32];
+    float * sb = shbuf + spw * 32;
+
+    for (int sp = 0; sp < 8; sp++) {
+        const int is = sp;
+        uint8_t sc, m;
+        get_scale_min_k4(is, x->scales, sc, m);
+        const float d1 = d * sc; const float m1 = dmin * m;
+
+        const int gi = 32*sp + lane;
+        const uint8_t L = (x->qs[gi/4] >> (2*(gi & 3))) & 3;
+        sb[lane] = d1 * L - m1;
+        __syncthreads();
+        float val = sb[lane];
+        for (int step = 1; step < 32; step <<= 1) {
+            float other = __shfl_xor_sync(0xFFFFFFFF, val, step, 32);
+            val = (lane & step) ? (other - val) : (other + val);
+        }
+        val = val * (ggml_cuda_rq2_signs_dev[lane] / sqrtf(32.0f));
+        dst_row[b * QK_RQ2 + 32*sp + lane] = ggml_cuda_cast<dst_t>(val);
+    }
+}
+
+template <typename dst_t>
+static void get_rows_cuda_rq2(
+        const void * src0_d, const int32_t * src1_d, dst_t * dst_d,
+        const int64_t ne00, const size_t nb01, const size_t nb02, const size_t nb03,
+        const int64_t ne10, const int64_t ne11, const int64_t ne12, const size_t nb10, const size_t nb11, const size_t nb12,
+        const size_t nb1, const size_t nb2, const size_t nb3,
+        cudaStream_t stream) {
+    GGML_ASSERT(ne00 % QK_RQ2 == 0);
+    ggml_cuda_rq2_init_signs();
+    constexpr int SUPERBLOCKS_PER_BLOCK = 8;
+    const int64_t nblocks = ne00 / QK_RQ2;
+    const dim3 block_dims(32, SUPERBLOCKS_PER_BLOCK, 1);
+    const dim3 block_nums(ne10, (nblocks + SUPERBLOCKS_PER_BLOCK - 1) / SUPERBLOCKS_PER_BLOCK,
+                          MIN(ne11*ne12, (int64_t) UINT16_MAX));
+    const size_t st1 = nb1 / sizeof(dst_t);
+    const size_t st2 = nb2 / sizeof(dst_t);
+    const size_t st3 = nb3 / sizeof(dst_t);
+    const size_t st10 = nb10 / sizeof(int32_t);
+    const size_t st11 = nb11 / sizeof(int32_t);
+    const size_t st12 = nb12 / sizeof(int32_t);
+    k_get_rows_rq2<<<block_nums, block_dims, 0, stream>>>(
+        (const block_rq2 *) src0_d, src1_d, dst_d,
+        ne00, ne11, ne12,
+        st1, st2, st3,
+        nb01, nb02, nb03,
+        st10, st11, st12);
+}
 
 template<int qk, int qr, dequantize_kernel_t dequantize_kernel, typename dst_t>
 static __global__ void k_get_rows(
@@ -354,6 +628,18 @@ static void ggml_cuda_get_rows_switch_src0_type(
             break;
         case GGML_TYPE_Q4_K:
             get_rows_cuda_kq<32, dst_t, dequantize_q4_K<dst_t>>(src0_d, src1_d, dst_d,
+                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+            break;
+        case GGML_TYPE_RQ4:
+            get_rows_cuda_rq4(src0_d, src1_d, dst_d,
+                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+            break;
+        case GGML_TYPE_RQ3:
+            get_rows_cuda_rq3(src0_d, src1_d, dst_d,
+                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+            break;
+        case GGML_TYPE_RQ2:
+            get_rows_cuda_rq2(src0_d, src1_d, dst_d,
                 ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
         case GGML_TYPE_Q5_K:

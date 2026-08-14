@@ -467,6 +467,18 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type 
                      ftype == LLAMA_FTYPE_MOSTLY_IQ1_M) {
                 new_type = GGML_TYPE_Q5_K;
             }
+            // RQ4_K_L: put RQ4 on the (tied) token embedding now that CPU get_rows supports it.
+            else if (ftype == LLAMA_FTYPE_MOSTLY_RQ4_K_L && qs.has_tied_embeddings && category == tensor_category::TOKEN_EMBD) {
+                new_type = GGML_TYPE_RQ4;
+            }
+            // RQ3_K_L: elevate the (tied) token embedding to Q4_K (3-bit base + bump).
+            else if (ftype == LLAMA_FTYPE_MOSTLY_RQ3_K_L && qs.has_tied_embeddings && category == tensor_category::TOKEN_EMBD) {
+                new_type = GGML_TYPE_Q4_K;
+            }
+            // RQ2_K_L: elevate the (tied) token embedding to Q3_K (2-bit base + bump).
+            else if (ftype == LLAMA_FTYPE_MOSTLY_RQ2_K_L && qs.has_tied_embeddings && category == tensor_category::TOKEN_EMBD) {
+                new_type = GGML_TYPE_Q3_K;
+            }
             else if (new_type != GGML_TYPE_Q8_0) {
                 new_type = GGML_TYPE_Q6_K;
             }
@@ -495,6 +507,18 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type 
             }
             else if (ftype == LLAMA_FTYPE_MOSTLY_TQ1_0 || ftype == LLAMA_FTYPE_MOSTLY_TQ2_0 || ftype == LLAMA_FTYPE_MOSTLY_Q2_0) {
                 new_type = GGML_TYPE_Q4_K;
+            }
+            // RQ4_K_L: put RQ4 on the token embedding (non-tied) now that CPU get_rows supports it.
+            else if (ftype == LLAMA_FTYPE_MOSTLY_RQ4_K_L) {
+                new_type = GGML_TYPE_RQ4;
+            }
+            // RQ3_K_L: elevate the (non-tied) token embedding to Q4_K (3-bit base + bump).
+            else if (ftype == LLAMA_FTYPE_MOSTLY_RQ3_K_L) {
+                new_type = GGML_TYPE_Q4_K;
+            }
+            // RQ2_K_L: elevate the (non-tied) token embedding to Q3_K (2-bit base + bump).
+            else if (ftype == LLAMA_FTYPE_MOSTLY_RQ2_K_L) {
+                new_type = GGML_TYPE_Q3_K;
             }
         }
     } else if (ftype == LLAMA_FTYPE_MOSTLY_IQ2_XXS || ftype == LLAMA_FTYPE_MOSTLY_IQ2_XS || ftype == LLAMA_FTYPE_MOSTLY_IQ1_S ||
@@ -541,6 +565,9 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type 
             new_type = qs.i_attention_wv < 2 ? GGML_TYPE_Q5_K : GGML_TYPE_Q4_K;
         }
         else if (ftype == LLAMA_FTYPE_MOSTLY_Q3_K_L) new_type = GGML_TYPE_Q5_K;
+        else if (ftype == LLAMA_FTYPE_MOSTLY_RQ4_K_L) new_type = GGML_TYPE_Q6_K;
+        else if (ftype == LLAMA_FTYPE_MOSTLY_RQ3_K_L) new_type = GGML_TYPE_Q5_K;
+        else if (ftype == LLAMA_FTYPE_MOSTLY_RQ2_K_L) new_type = GGML_TYPE_Q5_K;
         else if ((ftype == LLAMA_FTYPE_MOSTLY_IQ4_NL || ftype == LLAMA_FTYPE_MOSTLY_IQ4_XS) && qs.model.hparams.n_gqa() >= 4) {
             new_type = GGML_TYPE_Q5_K;
         }
@@ -600,6 +627,15 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type 
         else if (ftype == LLAMA_FTYPE_MOSTLY_Q3_K_L) {
             new_type = arch == LLM_ARCH_FALCON ? GGML_TYPE_Q4_K : GGML_TYPE_Q5_K;
         }
+        else if (ftype == LLAMA_FTYPE_MOSTLY_RQ4_K_L) {
+            new_type = arch == LLM_ARCH_FALCON ? GGML_TYPE_Q5_K : GGML_TYPE_Q6_K;
+        }
+        else if (ftype == LLAMA_FTYPE_MOSTLY_RQ3_K_L) {
+            new_type = GGML_TYPE_Q5_K;
+        }
+        else if (ftype == LLAMA_FTYPE_MOSTLY_RQ2_K_L) {
+            new_type = GGML_TYPE_Q5_K;
+        }
         else if (ftype == LLAMA_FTYPE_MOSTLY_Q4_K_M) {
             if (arch == LLM_ARCH_FALCON) {
                 new_type = i_layer < n_layer/16 ? GGML_TYPE_Q6_K :
@@ -637,16 +673,25 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type 
                 else if (ftype == LLAMA_FTYPE_MOSTLY_IQ3_XXS) new_type = GGML_TYPE_IQ3_S;
                 else if (ftype == LLAMA_FTYPE_MOSTLY_Q3_K_M ) new_type = GGML_TYPE_Q4_K;
                 else if (ftype == LLAMA_FTYPE_MOSTLY_Q3_K_L ) new_type = GGML_TYPE_Q5_K;
+                else if (ftype == LLAMA_FTYPE_MOSTLY_RQ4_K_L) new_type = GGML_TYPE_Q5_K;
+                else if (ftype == LLAMA_FTYPE_MOSTLY_RQ3_K_L) new_type = GGML_TYPE_Q4_K;
+                else if (ftype == LLAMA_FTYPE_MOSTLY_RQ2_K_L) new_type = GGML_TYPE_Q4_K;
                 else if (ftype == LLAMA_FTYPE_MOSTLY_IQ3_M  ) new_type = GGML_TYPE_Q4_K;
             }
         } else {
             if (ftype == LLAMA_FTYPE_MOSTLY_Q3_K_L) new_type = GGML_TYPE_Q4_K;
+            if (ftype == LLAMA_FTYPE_MOSTLY_RQ4_K_L) new_type = GGML_TYPE_Q5_K;
         }
+        if (ftype == LLAMA_FTYPE_MOSTLY_RQ3_K_L) new_type = GGML_TYPE_Q4_K;
+        if (ftype == LLAMA_FTYPE_MOSTLY_RQ2_K_L) new_type = GGML_TYPE_Q4_K;
     }
     else if (category == tensor_category::ATTENTION_QKV) {
         if (ftype == LLAMA_FTYPE_MOSTLY_Q3_K_M || ftype == LLAMA_FTYPE_MOSTLY_Q3_K_L || ftype == LLAMA_FTYPE_MOSTLY_IQ3_M) {
             new_type = GGML_TYPE_Q4_K;
         }
+        else if (ftype == LLAMA_FTYPE_MOSTLY_RQ4_K_L) new_type = GGML_TYPE_Q5_K;
+        else if (ftype == LLAMA_FTYPE_MOSTLY_RQ3_K_L) new_type = GGML_TYPE_Q4_K;
+        else if (ftype == LLAMA_FTYPE_MOSTLY_RQ2_K_L) new_type = GGML_TYPE_Q4_K;
         else if (ftype == LLAMA_FTYPE_MOSTLY_Q4_K_M) new_type = GGML_TYPE_Q5_K;
         else if (ftype == LLAMA_FTYPE_MOSTLY_Q5_K_M) new_type = GGML_TYPE_Q6_K;
     }
@@ -829,6 +874,9 @@ ggml_type llama_ftype_get_default_type(llama_ftype ftype) {
         case LLAMA_FTYPE_MOSTLY_Q5_K_S:
         case LLAMA_FTYPE_MOSTLY_Q5_K_M:  return GGML_TYPE_Q5_K;
         case LLAMA_FTYPE_MOSTLY_Q6_K:    return GGML_TYPE_Q6_K;
+        case LLAMA_FTYPE_MOSTLY_RQ4_K_L: return GGML_TYPE_RQ4;
+        case LLAMA_FTYPE_MOSTLY_RQ3_K_L: return GGML_TYPE_RQ3;
+        case LLAMA_FTYPE_MOSTLY_RQ2_K_L: return GGML_TYPE_RQ2;
         case LLAMA_FTYPE_MOSTLY_TQ1_0:   return GGML_TYPE_TQ1_0;
         case LLAMA_FTYPE_MOSTLY_TQ2_0:   return GGML_TYPE_TQ2_0;
         case LLAMA_FTYPE_MOSTLY_IQ2_XXS: return GGML_TYPE_IQ2_XXS;

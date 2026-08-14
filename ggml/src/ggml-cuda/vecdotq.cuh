@@ -1,6 +1,7 @@
 #pragma once
 
 #include "common.cuh"
+#include "rq4-signs.cuh"
 
 #include <cstdint>
 
@@ -951,6 +952,227 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1(
     }
 
     return vec_dot_q4_K_q8_1_impl_vmmq(v, u, sc, m, bq4_K->dm, d8);
+}
+
+#define VDR_RQ4_Q8_1_MMVQ 2
+#define VDR_RQ4_Q8_1_MMQ  8
+
+// local copy of get_scale_min_k4 for Q4_K-style scale unpacking
+static __device__ __forceinline__ void get_scale_min_k4_rq4(int j, const uint8_t * q, uint8_t & d, uint8_t & m) {
+    if (j < 4) {
+        d = q[j] & 63; m = q[j + 4] & 63;
+    } else {
+        d = (q[j+4] & 0xF) | ((q[j-4] >> 6) << 4);
+        m = (q[j+4] >>  4) | ((q[j-0] >> 6) << 4);
+    }
+}
+
+// Local Q4_K-style scale/min unpacker for the RQ4 warp-parallel ncols1 decode kernel
+// (mirror of RQ4-repo mmq.cuh:get_scale_min_k4_local). Body identical to get_scale_min_k4_rq4;
+// kept under the upstream name so rq4_warp_block_dot ports verbatim from the RQ4 repo.
+static __device__ __forceinline__ void get_scale_min_k4_local(int j, const uint8_t * q, uint8_t & d, uint8_t & m) {
+    if (j < 4) {
+        d = q[j] & 63; m = q[j + 4] & 63;
+    } else {
+        d = (q[j+4] & 0xF) | ((q[j-4] >> 6) << 4);
+        m = (q[j+4] >>  4) | ((q[j-0] >> 6) << 4);
+    }
+}
+
+// Plain (no weight-side WHT) RQ4 vec_dot for the GENERIC MMVQ path (ncols 2-8).
+// The activation MUST arrive forward-WHT-rotated (ggml_cuda_rq4_prep_act produces
+// exactly this layout). By WHT orthogonality:
+//   <WHT^-1(d*sc*L - dmin*m), a_nat> = <d*sc*L - dmin*m, WHT(a_nat)>
+//                                    = d*sc*<L, a_rot> - dmin*m*sum(a_rot)
+// so the per-block scalar inverse WHT of vec_dot_rq4_q8_1 collapses to a plain
+// Q4_K-style dp4a dot against the rotated q8 (mirrors vec_dot_q4_K_q8_1_impl_vmmq).
+// Cooperative VDR=2 form (matches Q4_K's VDR_Q4_K_Q8_1_MMVQ=2). qi = QI4_K = 32
+// (QK_K/(4*QR4_K) = 256/(4*2)), so qi/vdr = 16 -> 16 threads cooperate per superblock
+// (iqs = 2*(tid%16) in {0,2,...,30}). Each thread handles one 16-elem half of a single
+// sub-block (4 int32 packs, 8 dp4a): t = iqs/2 in 0..15 -> is = t>>1 (sub-block 0..7),
+// half = t&1 (which 4-int32 half). Two threads cover one sub-block; the caller's
+// warp_reduce_sum (mmvq.cu:657) sums the 16 per-half partials (d, dmin block-global;
+// d_act, sc, m per-subblock constants) and each lane's running sum across superblocks ->
+// algebraically identical to the serial 128-dp4a loop (same per-subblock decomposition
+// rq4_warp_block_dot uses with warp_reduce_sum).
+//
+// Outliers: the generic signature carries no FP32 activation, so the sparse patch
+// (ol_delta * a_nat) cannot be applied inline. In no-outlier mode (all ol_loc==0x1F)
+// it is 0 anyway -> bit-equivalent to vec_dot_rq4_q8_1. Outlier models must run
+// ggml_cuda_rq4_mmq_outlier_corr as a post-pass feeding the un-rotated src1.
+static __device__ __forceinline__ float vec_dot_rq4_q8_1_rot(
+        const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    const block_rq4 * bq = (const block_rq4 *) vbq + kbx;
+
+    const float d    = __low2float(bq->dm);
+    const float dmin = __high2float(bq->dm);
+
+    // VDR_RQ4_Q8_1_MMVQ == 2, qi == QI4_K == 32 -> qi/vdr = 16 threads/superblock.
+    // iqs = 2*(tid%16) -> t = iqs/2 in 0..15 selects one 16-elem half of a sub-block:
+    //   is   = t>>1  -> sub-block 0..7 (32 elems, 8 int32 packs each)
+    //   half = t&1   -> which 4-int32 half of the sub-block (bytes half*16..half*16+15)
+    // sp = is>>1; is even -> low nibble of qs[sp*32..], is odd -> high nibble.
+    const int t    = iqs / 2;
+    const int is   = t >> 1;
+    const int half = t & 1;
+    const int sp   = is >> 1;
+
+    // Activation first (overlap its latency with the weight nibble unpack below):
+    // bq8_1[is].qs[half*16 ..] = 4 int32 (16 rotated int8) for this half-sub-block.
+    const int * aq = (const int *)(bq8_1[is].qs + half * 16);
+    const float d_act = __low2float(bq8_1[is].ds);
+
+    // Weight: 4 int32 from qs[sp*32 + half*16 ..], nibble-extracted by sub-block parity.
+    const int * qp_i = (const int *)(bq->qs + sp * 32 + half * 16);
+    int w0, w1, w2, w3;
+    if (is & 1) {
+        // high nibble of each byte -> (x>>4)&0x0F0F0F0F (per-byte, no cross-byte bleed)
+        w0 = (qp_i[0] >> 4) & 0x0F0F0F0F;
+        w1 = (qp_i[1] >> 4) & 0x0F0F0F0F;
+        w2 = (qp_i[2] >> 4) & 0x0F0F0F0F;
+        w3 = (qp_i[3] >> 4) & 0x0F0F0F0F;
+    } else {
+        // low nibble
+        w0 = qp_i[0] & 0x0F0F0F0F;
+        w1 = qp_i[1] & 0x0F0F0F0F;
+        w2 = qp_i[2] & 0x0F0F0F0F;
+        w3 = qp_i[3] & 0x0F0F0F0F;
+    }
+
+    // dot1 = <L, rotated_q8> (scale term); dot2 = sum(rotated_q8) (min term).
+    // Two independent chains — issue each chain's first dp4a back-to-back so they overlap.
+    int dot1 = ggml_cuda_dp4a(w0, aq[0], 0);
+    int dot2 = ggml_cuda_dp4a(0x01010101, aq[0], 0);
+    dot1     = ggml_cuda_dp4a(w1, aq[1], dot1);
+    dot2     = ggml_cuda_dp4a(0x01010101, aq[1], dot2);
+    dot1     = ggml_cuda_dp4a(w2, aq[2], dot1);
+    dot2     = ggml_cuda_dp4a(0x01010101, aq[2], dot2);
+    dot1     = ggml_cuda_dp4a(w3, aq[3], dot1);
+    dot2     = ggml_cuda_dp4a(0x01010101, aq[3], dot2);
+
+    uint8_t sc, m;
+    get_scale_min_k4_rq4(is, bq->scales, sc, m);
+
+    // PARTIAL per-thread contribution (this half-sub-block); warp_reduce_sum combines the
+    // 2 half partners per sub-block (and accumulates across superblocks) -> reconstructs
+    // d*sumf_d - dmin*sumf_m for the row.
+    return d * d_act * sc * (float) dot1 - dmin * d_act * m * (float) dot2;
+}
+
+#define VDR_RQ3_Q8_1_MMVQ 2
+#define VDR_RQ3_Q8_1_MMQ  8
+
+// Plain (no weight-side WHT) RQ3 vec_dot for the GENERIC MMVQ path (ncols 2-8).
+// The activation arrives forward-WHT-rotated (ggml_cuda_rq3_prep_act). By WHT
+// orthogonality <WHT^-1(d*sc*L - dmin*m), a> = d*sc*<L,a_rot> - dmin*m*sum(a_rot),
+// so the per-block inverse WHT collapses to a plain dp4a dot against the rotated
+// q8. Cooperative VDR=2 form (same geometry as RQ4): qi=QI4_K=32 -> qi/vdr=16
+// threads/superblock; iqs=2*(tid%16), t=iqs/2 in 0..15.
+//
+// Flat 3-bit packing: thread t handles global elements gi_base..gi_base+15
+// (gi_base=16*t). bits 0-1 in qs[gi/4] (shift 2*(gi%4)), bit 2 in hmask[gi/8]
+// (shift gi%8). Each int32 wk holds 4 consecutive levels as int8 lanes.
+static __device__ __forceinline__ float vec_dot_rq3_q8_1_rot(
+        const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    const block_rq3 * bq = (const block_rq3 *) vbq + kbx;
+
+    const float d    = __low2float(bq->dm);
+    const float dmin = __high2float(bq->dm);
+
+    const int t    = iqs / 2;       // 0..15
+    const int isub = t >> 1;        // sub-block 0..7 (== q8_1 block index)
+    const int half = t & 1;         // which 16-elem half of the sub-block
+
+    // Activation: bq8_1[isub].qs[half*16..] = 4 int32 (16 rotated int8).
+    const int * aq = (const int *)(bq8_1[isub].qs + half * 16);
+    const float d_act = __low2float(bq8_1[isub].ds);
+
+    // Weight flat 3-bit levels for the 16 elements of this chunk.
+    const int gi_base = 16 * t;
+    const uint8_t * qs_l = bq->qs    + gi_base/4;   // 4 bytes (16 two-bit lows)
+    const uint8_t * hm_l = bq->hmask + gi_base/8;   // 2 bytes (16 high bits)
+    const uint32_t q0 = qs_l[0], q1 = qs_l[1], q2 = qs_l[2], q3 = qs_l[3];
+    const uint32_t h01 = hm_l[0];   // high bits, elements gi_base+0..7
+    const uint32_t h23 = hm_l[1];   // high bits, elements gi_base+8..15
+
+#define RQ3_LVL(qk, j, hb, bit) ((((qk) >> (2*(j))) & 3u) | ((((hb) >> (bit)) & 1u) << 2))
+    // wk byte-lane j = level for element gi_base + 4k + j.
+    const int w0 = (int)(RQ3_LVL(q0,0,h01,0)       | (RQ3_LVL(q0,1,h01,1) << 8)  | (RQ3_LVL(q0,2,h01,2) << 16) | (RQ3_LVL(q0,3,h01,3) << 24));
+    const int w1 = (int)(RQ3_LVL(q1,0,h01,4)       | (RQ3_LVL(q1,1,h01,5) << 8)  | (RQ3_LVL(q1,2,h01,6) << 16) | (RQ3_LVL(q1,3,h01,7) << 24));
+    const int w2 = (int)(RQ3_LVL(q2,0,h23,0)       | (RQ3_LVL(q2,1,h23,1) << 8)  | (RQ3_LVL(q2,2,h23,2) << 16) | (RQ3_LVL(q2,3,h23,3) << 24));
+    const int w3 = (int)(RQ3_LVL(q3,0,h23,4)       | (RQ3_LVL(q3,1,h23,5) << 8)  | (RQ3_LVL(q3,2,h23,6) << 16) | (RQ3_LVL(q3,3,h23,7) << 24));
+#undef RQ3_LVL
+
+    // dot1 = <L, rotated_q8> (scale term); dot2 = sum(rotated_q8) (min term).
+    int dot1 = ggml_cuda_dp4a(w0, aq[0], 0);
+    int dot2 = ggml_cuda_dp4a(0x01010101, aq[0], 0);
+    dot1     = ggml_cuda_dp4a(w1, aq[1], dot1);
+    dot2     = ggml_cuda_dp4a(0x01010101, aq[1], dot2);
+    dot1     = ggml_cuda_dp4a(w2, aq[2], dot1);
+    dot2     = ggml_cuda_dp4a(0x01010101, aq[2], dot2);
+    dot1     = ggml_cuda_dp4a(w3, aq[3], dot1);
+    dot2     = ggml_cuda_dp4a(0x01010101, aq[3], dot2);
+
+    uint8_t sc, m;
+    get_scale_min_k4_rq4(isub, bq->scales, sc, m);
+
+    return d * d_act * sc * (float) dot1 - dmin * d_act * m * (float) dot2;
+}
+#define VDR_RQ2_Q8_1_MMVQ 2
+#define VDR_RQ2_Q8_1_MMQ  8
+
+// Plain (no weight-side WHT) RQ2 vec_dot for the GENERIC MMVQ path (ncols 2-8).
+// The activation arrives forward-WHT-rotated (ggml_cuda_rq2_prep_act). By WHT
+// orthogonality the per-block inverse WHT collapses to a plain dp4a dot against
+// the rotated q8. Cooperative VDR=2 form (same geometry as RQ3/RQ4): qi=QI4_K=32
+// -> qi/vdr=16 threads/superblock; iqs=2*(tid%16), t=iqs/2 in 0..15.
+//
+// Flat 2-bit packing (NO hmask): thread t handles global elements gi_base..gi_base+15
+// (gi_base=16*t). bits 0-1 in qs[gi/4] (shift 2*(gi%4)). Each int32 wk holds 4
+// consecutive levels as int8 lanes.
+static __device__ __forceinline__ float vec_dot_rq2_q8_1_rot(
+        const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    const block_rq2 * bq = (const block_rq2 *) vbq + kbx;
+
+    const float d    = __low2float(bq->dm);
+    const float dmin = __high2float(bq->dm);
+
+    const int t    = iqs / 2;       // 0..15
+    const int isub = t >> 1;        // sub-block 0..7 (== q8_1 block index)
+    const int half = t & 1;         // which 16-elem half of the sub-block
+
+    const int * aq = (const int *)(bq8_1[isub].qs + half * 16);
+    const float d_act = __low2float(bq8_1[isub].ds);
+
+    // Weight flat 2-bit levels for the 16 elements of this chunk (no hmask).
+    const int gi_base = 16 * t;
+    const uint8_t * qs_l = bq->qs + gi_base/4;   // 4 bytes (16 two-bit levels)
+    const uint32_t q0 = qs_l[0], q1 = qs_l[1], q2 = qs_l[2], q3 = qs_l[3];
+
+#define RQ2_LVL(qk, j) (((qk) >> (2*(j))) & 3u)
+    const int w0 = (int)(RQ2_LVL(q0,0)       | (RQ2_LVL(q0,1) << 8)  | (RQ2_LVL(q0,2) << 16) | (RQ2_LVL(q0,3) << 24));
+    const int w1 = (int)(RQ2_LVL(q1,0)       | (RQ2_LVL(q1,1) << 8)  | (RQ2_LVL(q1,2) << 16) | (RQ2_LVL(q1,3) << 24));
+    const int w2 = (int)(RQ2_LVL(q2,0)       | (RQ2_LVL(q2,1) << 8)  | (RQ2_LVL(q2,2) << 16) | (RQ2_LVL(q2,3) << 24));
+    const int w3 = (int)(RQ2_LVL(q3,0)       | (RQ2_LVL(q3,1) << 8)  | (RQ2_LVL(q3,2) << 16) | (RQ2_LVL(q3,3) << 24));
+#undef RQ2_LVL
+
+    // dot1 = <L, rotated_q8> (scale term); dot2 = sum(rotated_q8) (min term).
+    int dot1 = ggml_cuda_dp4a(w0, aq[0], 0);
+    int dot2 = ggml_cuda_dp4a(0x01010101, aq[0], 0);
+    dot1     = ggml_cuda_dp4a(w1, aq[1], dot1);
+    dot2     = ggml_cuda_dp4a(0x01010101, aq[1], dot2);
+    dot1     = ggml_cuda_dp4a(w2, aq[2], dot1);
+    dot2     = ggml_cuda_dp4a(0x01010101, aq[2], dot2);
+    dot1     = ggml_cuda_dp4a(w3, aq[3], dot1);
+    dot2     = ggml_cuda_dp4a(0x01010101, aq[3], dot2);
+
+    uint8_t sc, m;
+    get_scale_min_k4_rq4(isub, bq->scales, sc, m);
+
+    return d * d_act * sc * (float) dot1 - dmin * d_act * m * (float) dot2;
 }
 
 static __device__ __forceinline__ float vec_dot_q5_K_q8_1(

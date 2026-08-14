@@ -2597,6 +2597,7 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.FFN_GATE_EXP,
         MODEL_TENSOR.FFN_DOWN_EXP,
         MODEL_TENSOR.FFN_UP_EXP,
+        MODEL_TENSOR.FFN_GATE_UP_EXP,
     ],
     MODEL_ARCH.QWEN3NEXT: [
         MODEL_TENSOR.TOKEN_EMBD,
@@ -5130,6 +5131,9 @@ class GGMLQuantizationType(IntEnum):
     Q5_K    = 13
     Q6_K    = 14
     Q8_K    = 15
+    RQ4     = 47
+    RQ3     = 48
+    RQ2     = 49
     IQ2_XXS = 16
     IQ2_XS  = 17
     IQ3_XXS = 18
@@ -5207,6 +5211,9 @@ class LlamaFileType(IntEnum):
     MOSTLY_NVFP4         = 39  # except 1d tensors
     MOSTLY_Q1_0          = 40  # except 1d tensors
     MOSTLY_Q2_0          = 41  # except 1d tensors
+    MOSTLY_RQ4_K_L       = 47  # except 1d tensors
+    MOSTLY_RQ3_K_L       = 48  # except 1d tensors
+    MOSTLY_RQ2_K_L       = 49  # except 1d tensors
 
     GUESSED              = 1024  # not specified in the model file
 
@@ -5320,6 +5327,9 @@ GGML_QUANT_SIZES: dict[GGMLQuantizationType, tuple[int, int]] = {
     GGMLQuantizationType.Q5_K:    (256, 2 + 2 + QK_K // 2 + QK_K // 8 + 12),
     GGMLQuantizationType.Q6_K:    (256, 2 + QK_K // 2 + QK_K // 4 + QK_K // 16),
     GGMLQuantizationType.Q8_K:    (256, 4 + QK_K + QK_K // 8),
+    GGMLQuantizationType.RQ4:     (256, 2 + 2 + QK_K // 2 + 12),   # block_rq4 == block_q4_K (144 B)
+    GGMLQuantizationType.RQ3:     (256, 2 + 2 + 12 + QK_K // 8 + QK_K // 4),  # dm(4)+scales(12)+hmask(32)+qs(64) = 112 B
+    GGMLQuantizationType.RQ2:     (256, 2 + 2 + 12 + QK_K // 4),   # dm(4)+scales(12)+qs(64) = 80 B
     GGMLQuantizationType.IQ2_XXS: (256, 2 + QK_K // 4),
     GGMLQuantizationType.IQ2_XS:  (256, 2 + QK_K // 4 + QK_K // 32),
     GGMLQuantizationType.IQ3_XXS: (256, 2 + QK_K // 4 + QK_K // 8),

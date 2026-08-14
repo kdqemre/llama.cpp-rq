@@ -1,5 +1,8 @@
 #include "convert.cuh"
 #include "dequantize.cuh"
+#include "rq4-signs.cuh"
+#include "rq3-signs.cuh"
+#include "rq2-signs.cuh"
 
 #include <cstdint>
 
@@ -302,6 +305,163 @@ static void dequantize_row_q4_K_cuda(const void * vx, dst_t * y, const int64_t k
     dequantize_block_q4_K<<<nb, 32, 0, stream>>>(vx, y);
 }
 
+// RQ4 CUDA dequantize: 256-el superblock, 8 sub-blocks of 32, WHT per sub-block
+__constant__ static const float rq4_centroids_cuda[16] = {
+    -2.732127f, -2.068495f, -1.617513f, -1.255729f,
+    -0.941906f, -0.656424f, -0.387837f, -0.128323f,
+     0.128323f,  0.387837f,  0.656424f,  0.941906f,
+     1.255729f,  1.617513f,  2.068495f,  2.732127f
+};
+// RQ4 sign pattern now comes from ggml_cuda_rq4_signs_dev (rq4-signs.cuh),
+// parameterized by the RQ4_SIGNS env var with a byte-identical golden default.
+
+template<typename dst_t>
+static __global__ void dequantize_block_rq4(const void * __restrict__ vx, dst_t * __restrict__ yy) {
+    const int64_t i = blockIdx.x;
+    const block_rq4 * x = (const block_rq4 *)vx + i;
+    const int tid = threadIdx.x; // 0..31
+
+    dst_t * y = yy + i * QK_RQ4;
+    const float d   = __low2float(x->dm);
+    const float dmin = __high2float(x->dm);
+
+    __shared__ float sbuf[32];
+
+    // Process all 4 sub-block pairs sequentially with all 32 threads
+    for (int sp = 0; sp < 4; sp++) {
+        const int il = sp;
+        const int is = 2 * sp;
+        const uint8_t * q = x->qs + 32 * il;
+
+        uint8_t sc, m;
+        get_scale_min_k4(is + 0, x->scales, sc, m);
+        const float d1 = d * sc; const float m1 = dmin * m;
+        get_scale_min_k4(is + 1, x->scales, sc, m);
+        const float d2 = d * sc; const float m2 = dmin * m;
+
+        // Sub-block is: low nibble — one element per thread.
+        // Uniform dequant in rotated domain (d1*L - m1, min INSIDE inverse WHT).
+        sbuf[tid] = d1 * (q[tid] & 0xF) - m1;
+        __syncthreads();
+
+        // WHT butterfly via warp shuffle
+        float val = sbuf[tid];
+        for (int step = 1; step < 32; step <<= 1) {
+            float other = __shfl_xor_sync(0xFFFFFFFF, val, step, 32);
+            val = (tid & step) ? (other - val) : (other + val);
+        }
+        val = val * (ggml_cuda_rq4_signs_dev[tid] / sqrtf(32.0f));
+        y[64 * il + tid] = (dst_t)val;
+
+        // Sub-block is+1: high nibble
+        __syncthreads();
+        sbuf[tid] = d2 * (q[tid] >> 4) - m2;
+        __syncthreads();
+
+        val = sbuf[tid];
+        for (int step = 1; step < 32; step <<= 1) {
+            float other = __shfl_xor_sync(0xFFFFFFFF, val, step, 32);
+            val = (tid & step) ? (other - val) : (other + val);
+        }
+        val = val * (ggml_cuda_rq4_signs_dev[tid] / sqrtf(32.0f));
+        y[64 * il + 32 + tid] = (dst_t)val;
+    }
+}
+
+template<typename dst_t>
+static void dequantize_row_rq4_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
+    ggml_cuda_rq4_init_signs();
+    const int nb = k / QK_RQ4;
+    dequantize_block_rq4<<<nb, 32, 0, stream>>>(vx, y);
+}
+
+// RQ3 CUDA dequantize: 256-el superblock, 8 sub-blocks of 32, WHT per sub-block.
+// 3-bit level per element: bits 0-1 in qs[gi/4] (shift 2*(gi%4)), bit 2 in
+// hmask[gi/8] (shift gi%8). Rotated-domain weight d1*L - m1, then inverse WHT.
+template<typename dst_t>
+static __global__ void dequantize_block_rq3(const void * __restrict__ vx, dst_t * __restrict__ yy) {
+    const int64_t i = blockIdx.x;
+    const block_rq3 * x = (const block_rq3 *)vx + i;
+    const int tid = threadIdx.x; // 0..31
+
+    dst_t * y = yy + i * QK_RQ3;
+    const float d   = __low2float(x->dm);
+    const float dmin = __high2float(x->dm);
+
+    __shared__ float sbuf[32];
+
+    for (int sp = 0; sp < 8; sp++) {
+        const int is = sp;
+        uint8_t sc, m;
+        get_scale_min_k4(is, x->scales, sc, m);
+        const float d1 = d * sc; const float m1 = dmin * m;
+
+        const int gi = 32*sp + tid;
+        const uint8_t lo = (x->qs[gi/4] >> (2*(gi & 3))) & 3;
+        const uint8_t hi = (x->hmask[gi/8] >> (gi & 7)) & 1;
+        const uint8_t L = lo | (hi << 2);
+        sbuf[tid] = d1 * L - m1;
+        __syncthreads();
+
+        float val = sbuf[tid];
+        for (int step = 1; step < 32; step <<= 1) {
+            float other = __shfl_xor_sync(0xFFFFFFFF, val, step, 32);
+            val = (tid & step) ? (other - val) : (other + val);
+        }
+        val = val * (ggml_cuda_rq3_signs_dev[tid] / sqrtf(32.0f));
+        y[32*sp + tid] = (dst_t)val;
+    }
+}
+
+template<typename dst_t>
+static void dequantize_row_rq3_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
+    ggml_cuda_rq3_init_signs();
+    const int nb = k / QK_RQ3;
+    dequantize_block_rq3<<<nb, 32, 0, stream>>>(vx, y);
+}
+// RQ2 CUDA dequantize: 256-el superblock, 8 sub-blocks of 32, WHT per sub-block.
+// 2-bit level per element: bits 0-1 in qs[gi/4] (shift 2*(gi%4)). No hmask.
+// Rotated-domain weight d1*L - m1, then inverse WHT.
+template<typename dst_t>
+static __global__ void dequantize_block_rq2(const void * __restrict__ vx, dst_t * __restrict__ yy) {
+    const int64_t i = blockIdx.x;
+    const block_rq2 * x = (const block_rq2 *)vx + i;
+    const int tid = threadIdx.x; // 0..31
+
+    dst_t * y = yy + i * QK_RQ2;
+    const float d   = __low2float(x->dm);
+    const float dmin = __high2float(x->dm);
+
+    __shared__ float sbuf[32];
+
+    for (int sp = 0; sp < 8; sp++) {
+        const int is = sp;
+        uint8_t sc, m;
+        get_scale_min_k4(is, x->scales, sc, m);
+        const float d1 = d * sc; const float m1 = dmin * m;
+
+        const int gi = 32*sp + tid;
+        const uint8_t L = (x->qs[gi/4] >> (2*(gi & 3))) & 3;
+        sbuf[tid] = d1 * L - m1;
+        __syncthreads();
+
+        float val = sbuf[tid];
+        for (int step = 1; step < 32; step <<= 1) {
+            float other = __shfl_xor_sync(0xFFFFFFFF, val, step, 32);
+            val = (tid & step) ? (other - val) : (other + val);
+        }
+        val = val * (ggml_cuda_rq2_signs_dev[tid] / sqrtf(32.0f));
+        y[32*sp + tid] = (dst_t)val;
+    }
+}
+
+template<typename dst_t>
+static void dequantize_row_rq2_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
+    ggml_cuda_rq2_init_signs();
+    const int nb = k / QK_RQ2;
+    dequantize_block_rq2<<<nb, 32, 0, stream>>>(vx, y);
+}
+
 template<typename dst_t>
 static void dequantize_row_q5_K_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
     const int nb = k / QK_K;
@@ -477,6 +637,12 @@ to_bf16_cuda_t ggml_get_to_bf16_cuda(ggml_type type) {
             return dequantize_row_q3_K_cuda;
         case GGML_TYPE_Q4_K:
             return dequantize_row_q4_K_cuda;
+        case GGML_TYPE_RQ4:
+            return dequantize_row_rq4_cuda;
+        case GGML_TYPE_RQ3:
+            return dequantize_row_rq3_cuda;
+        case GGML_TYPE_RQ2:
+            return dequantize_row_rq2_cuda;
         case GGML_TYPE_Q5_K:
             return dequantize_row_q5_K_cuda;
         case GGML_TYPE_Q6_K:
@@ -537,6 +703,12 @@ to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
             return dequantize_row_q3_K_cuda;
         case GGML_TYPE_Q4_K:
             return dequantize_row_q4_K_cuda;
+        case GGML_TYPE_RQ4:
+            return dequantize_row_rq4_cuda;
+        case GGML_TYPE_RQ3:
+            return dequantize_row_rq3_cuda;
+        case GGML_TYPE_RQ2:
+            return dequantize_row_rq2_cuda;
         case GGML_TYPE_Q5_K:
             return dequantize_row_q5_K_cuda;
         case GGML_TYPE_Q6_K:
@@ -594,6 +766,12 @@ to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type) {
             return dequantize_row_q3_K_cuda;
         case GGML_TYPE_Q4_K:
             return dequantize_row_q4_K_cuda;
+        case GGML_TYPE_RQ4:
+            return dequantize_row_rq4_cuda;
+        case GGML_TYPE_RQ3:
+            return dequantize_row_rq3_cuda;
+        case GGML_TYPE_RQ2:
+            return dequantize_row_rq2_cuda;
         case GGML_TYPE_Q5_K:
             return dequantize_row_q5_K_cuda;
         case GGML_TYPE_Q6_K:
