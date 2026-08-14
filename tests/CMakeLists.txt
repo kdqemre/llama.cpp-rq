@@ -154,6 +154,7 @@ target_include_directories(test-rq2-cpu PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
 target_link_libraries(test-rq2-cpu PRIVATE ggml)
 llama_build(test-rq2-cuda.cpp)
 llama_build(test-rq3-k-l-cuda.cpp)
+llama_build(test-rq4-cuda.cpp)
 
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API (when building with shared libraries)
