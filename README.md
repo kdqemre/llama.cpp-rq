@@ -11,58 +11,7 @@ A fork of [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) (ggml 0.19
 One idea powers all three: **before quantizing, every 32-weight sub-block is rotated by a signed Walsh–Hadamard transform.** The rotation spreads outlier energy evenly across the sub-block, so t[...]
 
 ---
-## Why does this repository exist?
 
-LLM weight matrices contain **outliers** — a few weights 10–100× larger than the rest. Block quantization divides its codebook by the block's range, so one outlier inflates the step size for everyone, and the ordinary values collapse onto the lowest codes. At 2 bits (4 levels) this destroys the block's information entirely.
-
-### Standard block quantization (any bit width $b$)
-
-For a block $\mathbf{w} \in \mathbb{R}^B$:
-
-$$s = \frac{w_{\max} - w_{\min}}{2^b - 1}$$
-$$q_i = \text{round}\left(\frac{w_i - w_{\min}}{s}\right)$$
-$$\hat{w}_i = w_{\min} + q_i s$$
-
-The step $s$ is set by the **range**, not by where the values actually live.
-
-**Toy example ($b=4$, block of 4),** $\mathbf{w} = [1, 2, 3, 100]$:
-
-$$s = \frac{100-1}{15} = 6.60$$
-$$\mathbf{q} = [0, 0, 0, 15]$$
-$$\hat{\mathbf{w}} = [1, 1, 1, 100]$$
-
-| element | 1 | 2 | 3 | 100 |
-|---|---:|---:|---:|---:|
-| quantized | 1 | **1** | **1** | 100 |
-| relative error | 0% | **−50%** | **−66.7%** | 0% |
-
-The three ordinary values collapse onto a single code; 14 of 16 levels are wasted on the outlier's range. At $b=2$ the same block is worse still: $s=33$, codes $[0,0,0,3]$ — everything but the outlier maps to one level.
-
-### Rotated quantization (this repo)
-
-The Walsh–Hadamard matrix (Sylvester construction) is orthogonal up to scale:
-
-$$H_2 = \begin{pmatrix} 1 & 1 \\ 1 & -1 \end{pmatrix}$$
-$$H_{2n} = H_n \otimes H_2$$
-$$H_n H_n^\top = nI$$
-
-RQ rotates every 32-weight sub-block with a **signed** WHT — a per-lane sign diagonal $D = \text{diag}(\pm 1)$ followed by the fast butterfly:
-
-$$\mathbf{x}' = \frac{1}{\sqrt{32}} H_{32} D \mathbf{x}$$
-$$\|\mathbf{x}'\| = \|\mathbf{x}\|$$
-
-The transform preserves the L2 norm and **dilutes spikes**. Same toy block (shown with $H_4$ for readability):
-
-$$\frac{1}{2}H_4 [1, 2, 3, 100] = [53, -49, -50, 48]$$
-
-The spike's energy is now spread over all four coordinates, which all quantize at comparable magnitude — the codebook is used evenly. Sparse-outlier case ($b=4$, block of 8), $\mathbf{w} = [0.5, 1, 1.5, 2, 1, 3, 2, 40]$:
-
-| | codes used | step | L2 error | ordinary values |
-|---|---:|---:|---:|---|
-| standard | {0, 1, 15} — collapse | 2.63 | 2.02 | 1.0→0.5, 2.0→3.13 (−50…+57%) |
-| **rotated** | {−6,−5,5,6,7} — even | 2.40 | **1.86** | errors ≤ ~1.2, uniform |
-
-# TEST
 ## Why does this repository exist?
 
 LLM weight matrices contain **outliers** — a few weights 10–100× larger than the rest. Block quantization divides its codebook by the block's range, so one outlier inflates the step size for everyone, and the ordinary values collapse onto the lowest codes. At 2 bits (4 levels) this destroys the block's information entirely.
@@ -119,20 +68,6 @@ The outlier's energy is now spread across **all eight** coordinates — no singl
 | relative error | +134% | **−23%** | −49% | **+15%** | **−23%** | −23% | **+15%** | +2% |
 
 The mid-range values stop being systematically crushed — the 2.0s land at 2.30 (+15%) instead of 3.13 (+57%), the 1.0s at 0.77 (−23%) instead of 0.50 (−50%), and the outlier survives intact (40.0 -> 40.63). The cost concentrates on the single smallest value (0.5 -> 1.17) and the 1.5 (−49%). Errors become **proportional to magnitude** instead of a collapse pattern, and the block's L2 error drops 2.02 -> 1.47 (−27%) with the same 4-bit budget.
-
-The full pipeline, per sub-block at any bit width:
-
-$$\hat{\mathbf{w}} = \frac{1}{\sqrt{32}} H_{32} \mathcal{Q}^{-1}\left(\mathcal{Q}_b\left(\frac{1}{\sqrt{32}} H_{32} D \mathbf{w}\right)\right)$$
-
-At inference the standard K-quant scale/index machinery applies unchanged; the rotation itself is paid **once per activation token** (fused into the activation quantizer), not once per weight — that is what keeps RQ at Q4_K-class kernel speed.
-
-A toy block can't show the whole picture — the payoff is statistical. Across a real matrix, outlier coordinates are sparse; rotation guarantees every sub-block absorbs an equal slice of every outlier, so no block's step is blown and the error is isotropic instead of a systematic bias on common values. Measured at 27B scale (GSM8K-100, one harness for all rows):
-
-> **Qwen3.6-27B, 0-shot, MTP:** RQ2_K_L **92** vs Q2_K **64** (+28) · RQ3_K_L-rqmod **97** vs Q3_K_M 93 · RQ4_K_L-rqmod 88 vs Q4_K_M 89
-> **Qwen3.8-27B, 8-shot, MTP-off:** RQ2_K_L 93 vs Q2_K 91 · RQ2_K_L-rqmod **98** · 3-bit tier: RQ3_K_L 97 = Q3_K_M 97 · 4-bit tier: RQ4_K_L 97 = Q4_K_M 97
-
-**Honest scoping:** rotation helps where bits are scarce (2/3/4). At 5 bits the error-spreading that makes rotation great at low bits starts hurting exact multi-step arithmetic (a few natural-domain weights absorb a large aggregated error) — we built RQ5, measured it winning PPL but losing GSM8K, and stopped there. That is why this repo ships RQ2/RQ3/RQ4.
-# TEST
 
 The full pipeline, per sub-block at any bit width:
 
