@@ -8,7 +8,7 @@ A fork of [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) (ggml 0.19
 | `RQ3_K_L` | 48 | 112 B / 256 weights | 3.50 bpw | **4.33 bpw, 14.8 GB** |
 | `RQ4_K_L` | 47 | 144 B / 256 weights (byte-identical to `block_q4_K`) | 4.50 bpw | **5.25 bpw, 17.9 GB** |
 
-One idea powers all three: **before quantizing, every 32-weight sub-block is rotated by a signed Walsh–Hadamard transform.** The rotation spreads outlier energy evenly across the sub-block, so t[...]
+One idea powers all three: **before quantizing, every 32-weight sub-block is rotated by a signed Walsh–Hadamard transform.** The rotation spreads outlier energy evenly across the sub-block, so the quantizer's error stays uniform instead of being crushed by a few extreme values.
 
 ---
 
@@ -93,7 +93,7 @@ llama-quantize model-f16.gguf model-rq3.gguf RQ3_K_L 8
 llama-quantize model-f16.gguf model-rq4.gguf RQ4_K_L 8
 ```
 
-Each `_K_L` recipe mirrors the matching K-quant Large mixture — the bulk (FFN gate/up, SSM paths, small projections) gets the rotated low-bit type; sensitive tensors (attention projections, FFN-[...]
+Each `_K_L` recipe mirrors the matching K-quant Large mixture — the bulk (FFN gate/up, SSM paths, small projections) gets the rotated low-bit type; sensitive tensors (attention projections, FFN-down, embeddings) are elevated to Q5_K/Q6_K.
 
 ### Quantize — modular recipes (`--tensor-type`)
 
@@ -116,7 +116,7 @@ llama-quantize --tensor-type 'blk\\.[0-9]+\\.(attn_qkv|attn_v|ffn_down)\\.weight
                model-f16.gguf model-rq4rqmod.gguf RQ4_K_L 8
 ```
 
-> **Gotcha:** `--tensor-type` options must appear **before** the model path — the arg parser stops consuming options at the first positional, so overrides placed after the paths are silently ig[...]
+> **Gotcha:** `--tensor-type` options must appear **before** the model path — the arg parser stops consuming options at the first positional, so overrides placed after the paths are silently ignored. Patterns are regexes on tensor names; type tokens are case-insensitive.
 
 ### Run it
 
@@ -136,8 +136,8 @@ llama-cli -m model-rq3.gguf -ngl 99 -t 8 -n 80 --temp 0.0 \\
 
 ### What's inside (speed & quality work)
 
-- **Optimized rotation-sign search** — the $D$ diagonal is not random: offline sweeps over sign patterns (70+ candidates) move wikitext PPL by up to **1.4 points**; per-category diagonals add u[...]
-- **Fused CUDA kernels for all three types** — the WHT is fused into the activation quantizer (`prep_act`, once per token); the matmuls are plain dp4a/DP4A MMA over K-quant-layout blocks (RQ4's[...]
+- **Optimized rotation-sign search** — the $D$ diagonal is not random: offline sweeps over sign patterns (70+ candidates) move wikitext PPL by up to **1.4 points**; per-category diagonals add up to another −0.85. The winning patterns are baked in as defaults, so quantization is deterministic and fast.
+- **Fused CUDA kernels for all three types** — the WHT is fused into the activation quantizer (`prep_act`, once per token); the matmuls are plain dp4a/DP4A MMA over K-quant-layout blocks (RQ4's block is byte-identical to block_q4_K, so it rides the same MMQ tiles). MMVQ/MMQ/get_rows paths verified bit-exact vs CPU (NMSE suites: CPU ~1e-6, CUDA ~1e-4).
 - **MoE verified**, MTP draft heads quantize cleanly (84.9% acceptance on RQ4_K_L), fused GLU (gate+up+SwigLU) supported, plain-greedy decode 26–35 t/s at 27B on a single RTX 4090.
 
 ### Evidence (Qwen3.8-27B, 8-shot GSM8K-100, MTP-off, one harness)
