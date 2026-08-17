@@ -94,6 +94,7 @@ The ordinary values collapse: the 1.0s and 1.5 are crushed into 0.5, the 2.0s ar
 ### Rotated quantization (this repo)
 
 The Walsh–Hadamard matrix (Sylvester construction) is orthogonal up to scale:
+$$H_2 = \begin{pmatrix} 1 & 1 \\\\ 1 & -1 \end{pmatrix}$$
 
 $$H_2 = \begin{pmatrix} 1 & 1 \\ 1 & -1 \end{pmatrix}$$
 
