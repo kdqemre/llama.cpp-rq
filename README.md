@@ -62,6 +62,18 @@ The spike's energy is now spread over all four coordinates, which all quantize a
 | standard | {0, 1, 15} — collapse | 2.63 | 2.02 | 1.0→0.5, 2.0→3.13 (−50…+57%) |
 | **rotated** | {−6,−5,5,6,7} — even | 2.40 | **1.86** | errors ≤ ~1.2, uniform |
 
+# TEST
+The spike's energy is now spread over all coordinates, allowing the quantizer to use its codebook efficiently. 
+
+Let's look at the actual reconstruction of a sparse-outlier block ($b=4$, block of 8) before and after WHT:
+**Original Weights:** `[0.5,  1.0,  1.5,  2.0,  1.0,  3.0,  2.0,  40.0]` *(Notice the 40.0 outlier)*
+
+| Method | 4-bit Codebook Usage | What happens to the "Ordinary" values? | Resulting Information |
+| :--- | :--- | :--- | :--- |
+| **Standard (Q4)** | **Collapsed:** `{0, 1, 15}`<br>*(13 out of 16 codes are wasted)* | `1.0` is crushed to `0.5` **(-50% error)**<br>`2.0` is distorted to `3.13` **(+57% error)** | **Destroyed.** The outlier's gravity crushes the fine details into zero or random noise. |
+| **Rotated (RQ4)** | **Even:** `{−6, −5, 5, 6, 7}`<br>*(Codes are fully utilized)* | Errors are distributed uniformly (≤ 1.2).<br>Original patterns are preserved. | **Saved.** The outlier's energy is shared, reducing the overall L2 error significantly. |
+# TEST
+
 The full pipeline, per sub-block at any bit width:
 
 $$\hat{\mathbf{w}} = \frac{1}{\sqrt{32}} H_{32} \mathcal{Q}^{-1}\left(\mathcal{Q}_b\left(\frac{1}{\sqrt{32}} H_{32} D \mathbf{w}\right)\right)$$
