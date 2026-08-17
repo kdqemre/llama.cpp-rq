@@ -1,6 +1,6 @@
 # RQ — Rotated Quantization for llama.cpp
 
-A fork of [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) (ggml 0.19.0 base, commit `885c5bbe`) adding a family of **WHT-rotated K-quants** — RQ2, RQ3, RQ4 at 2/3/4 bits — as univer[...]
+A fork of [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) (ggml 0.19.0 base, commit `885c5bbe`) adding a family of **WHT-rotated K-quants** — RQ2, RQ3, RQ4 at 2/3/4 bits — as universal tensor types you can apply via fixed recipes or per-tensor mixes:
 
 | type | ggml ftype | block layout | nominal | measured @ Qwen3.8-27B |
 |---|---:|---|---:|---:|
