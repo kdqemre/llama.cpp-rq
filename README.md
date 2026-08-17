@@ -20,11 +20,11 @@ LLM weight matrices contain **outliers** — a few weights 10–100× larger tha
 
 For a block $\mathbf w \in \mathbb R^B$:
 
-$$s = \frac{w_{\max} - w_{\min}}{2^b - 1}, \qquad q_i = \mathrm{round}\!\left(\frac{w_i - w_{\min}}{s}\right), \qquad \hat w_i = w_{\min} + q_i\, s$$
+$$s = \frac{w_{\max} - w_{\min}}{2^b - 1}, \\\qquad q_i = \mathrm{round}\!\left(\frac{w_i - w_{\min}}{s}\right), \\\qquad \hat w_i = w_{\min} + q_i\, s$$
 
 The step $s$ is set by the **range**, not by where the values actually live.
 
-**Toy example ($b=4$, block of 4),** $\mathbf w = [1,\ 2,\ 3,\ 100\]$:
+**Toy example ($b=4$, block of 4),** $\mathbf w = [1,\ 2,\ 3,\ 100]$:
 
 $$s = \tfrac{100-1}{15} = 6.60 \;\Rightarrow\; \mathbf q = [0,\ 0,\ 0,\ 15] \;\Rightarrow\; \hat{\mathbf w} = [1,\ 1,\ 1,\ 100]$$
 
@@ -39,11 +39,11 @@ The three ordinary values collapse onto a single code; 14 of 16 levels are waste
 
 The Walsh–Hadamard matrix (Sylvester construction) is orthogonal up to scale:
 
-$$H_2 = \begin{pmatrix} 1 & 1 \\ 1 & -1 \end{pmatrix}, \qquad H_{2n} = H_n \otimes H_2, \qquad H_n H_n^\top = nI$$
+$$H_2 = \begin{pmatrix} 1 & 1 \\\ 1 & -1 \end{pmatrix}, \\\qquad H_{2n} = H_n \otimes H_2, \\\qquad H_n H_n^\top = nI$$
 
 RQ rotates every 32-weight sub-block with a **signed** WHT — a per-lane sign diagonal $D = \mathrm{diag}(\pm 1)$ followed by the fast butterfly:
 
-$$\mathbf x' = \tfrac{1}{\sqrt{32}}\, H_{32}\, D\, \mathbf x, \qquad \lVert \mathbf x' \rVert = \lVert \mathbf x \rVert$$
+$$\mathbf x' = \tfrac{1}{\sqrt{32}}\, H_{32}\, D\, \mathbf x, \\\qquad \lVert \mathbf x' \rVert = \lVert \mathbf x \rVert$$
 
 The transform preserves the L2 norm and **dilutes spikes**. Same toy block (shown with $H_4$ for readability):
 
@@ -89,18 +89,18 @@ RQ types are **universal tensor types**: mix them per tensor group with regex ov
 
 ```bash
 # RQ2_K_L-rqmod — 98/100 GSM8K on Qwen3.8-27B at 3.70 bpw
-llama-quantize --tensor-type 'token_embd\.weight=rq3' \
-               --tensor-type 'blk\.[0-9]+\.attn_output\.weight=rq4' \
+llama-quantize --tensor-type 'token_embd\\.weight=rq3' \\
+               --tensor-type 'blk\\.[0-9]+\\.attn_output\\.weight=rq4' \\
                model-f16.gguf model-rq2rqmod.gguf RQ2_K_L 8
 
 # RQ3_K_L-rqmod — 98/100 at 4.28 bpw
-llama-quantize --tensor-type 'token_embd\.weight=rq4' \
-               --tensor-type 'blk\.[0-9]+\.attn_output\.weight=rq4' \
+llama-quantize --tensor-type 'token_embd\\.weight=rq4' \\
+               --tensor-type 'blk\\.[0-9]+\\.attn_output\\.weight=rq4' \\
                model-f16.gguf model-rq3rqmod.gguf RQ3_K_L 8
 
 # RQ4_K_L-rqmod — bulk RQ4, elevate QKV/V/FFN-down to Q5_K
-llama-quantize --tensor-type 'blk\.[0-9]+\.(attn_qkv|attn_v|ffn_down)\.weight=q5_K' \
-               --tensor-type 'blk\.[0-9]+\.attn_output\.weight=rq4' \
+llama-quantize --tensor-type 'blk\\.[0-9]+\\.(attn_qkv|attn_v|ffn_down)\\.weight=q5_K' \\
+               --tensor-type 'blk\\.[0-9]+\\.attn_output\\.weight=rq4' \\
                model-f16.gguf model-rq4rqmod.gguf RQ4_K_L 8
 ```
 
@@ -110,15 +110,15 @@ llama-quantize --tensor-type 'blk\.[0-9]+\.(attn_qkv|attn_v|ffn_down)\.weight=q5
 
 ```bash
 # server
-llama-server -m model-rq3.gguf -ngl 99 -c 8192 -t 8 -fa on \
-  --jinja --reasoning off --temp 0.0 \
+llama-server -m model-rq3.gguf -ngl 99 -c 8192 -t 8 -fa on \\
+  --jinja --reasoning off --temp 0.0 \\
   --cache-type-k q8_0 --cache-type-v q8_0
 
 # MTP (models with blk.64.nextn heads — Qwen3.6/3.8 hybrids): verified 1.95× decode
 llama-server -m model-rq4.gguf ... --spec-type draft-mtp --spec-draft-n-max 3
 
 # one-shot CLI (non-interactive)
-llama-cli -m model-rq3.gguf -ngl 99 -t 8 -n 80 --temp 0.0 \
+llama-cli -m model-rq3.gguf -ngl 99 -t 8 -n 80 --temp 0.0 \\
   -p "Q: ...\nA:" -no-cnv --single-turn
 ```
 
@@ -148,8 +148,8 @@ Harness: canonical 8-shot CoT primer, plain greedy (temp 0, seed 0), ctx 8192, n
 ### Build & tests
 
 ```bash
-cmake -B build -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=89 \
-      -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA_FA=ON \
+cmake -B build -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=89 \\
+      -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA_FA=ON \\
       -DGGML_CUDA_GRAPHS=ON -DLLAMA_BUILD_SERVER=ON
 cmake --build build -j 8
 ctest --test-dir build -R 'rq2|rq3|rq4'   # NMSE + kernel parity suites
