@@ -122,15 +122,15 @@ llama-quantize --tensor-type 'blk\.[0-9]+\.(attn_qkv|attn_v|ffn_down)\.weight=q5
 
 ```bash
 # server
-llama-server -m model-rq3.gguf -ngl 99 -c 8192 -t 8 -fa on \\
-  --jinja --reasoning off --temp 0.0 \\
+llama-server -m model-rq3.gguf -ngl 99 -c 8192 -t 8 -fa on \
+  --jinja --reasoning off --temp 0.0 \
   --cache-type-k q8_0 --cache-type-v q8_0
 
 # MTP (models with blk.64.nextn heads — Qwen3.6/3.8 hybrids): verified 1.95× decode
 llama-server -m model-rq4.gguf ... --spec-type draft-mtp --spec-draft-n-max 3
 
 # one-shot CLI (non-interactive)
-llama-cli -m model-rq3.gguf -ngl 99 -t 8 -n 80 --temp 0.0 \\
+llama-cli -m model-rq3.gguf -ngl 99 -t 8 -n 80 --temp 0.0 \
   -p "Q: ...\nA:" -no-cnv --single-turn
 ```
 
