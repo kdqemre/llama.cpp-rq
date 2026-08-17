@@ -101,18 +101,18 @@ RQ types are **universal tensor types**: mix them per tensor group with regex ov
 
 ```bash
 # RQ2_K_L-rqmod — 98/100 GSM8K on Qwen3.8-27B at 3.70 bpw
-llama-quantize --tensor-type 'token_embd\\.weight=rq3' \\
-               --tensor-type 'blk\\.[0-9]+\\.attn_output\\.weight=rq4' \\
+llama-quantize --tensor-type 'token_embd\.weight=rq3' \
+               --tensor-type 'blk\.[0-9]+\.attn_output\.weight=rq4' \
                model-f16.gguf model-rq2rqmod.gguf RQ2_K_L 8
 
 # RQ3_K_L-rqmod — 98/100 at 4.28 bpw
-llama-quantize --tensor-type 'token_embd\\.weight=rq4' \\
-               --tensor-type 'blk\\.[0-9]+\\.attn_output\\.weight=rq4' \\
+llama-quantize --tensor-type 'token_embd\.weight=rq4' \
+               --tensor-type 'blk\.[0-9]+\.attn_output\.weight=rq4' \
                model-f16.gguf model-rq3rqmod.gguf RQ3_K_L 8
 
 # RQ4_K_L-rqmod — bulk RQ4, elevate QKV/V/FFN-down to Q5_K
-llama-quantize --tensor-type 'blk\\.[0-9]+\\.(attn_qkv|attn_v|ffn_down)\\.weight=q5_K' \\
-               --tensor-type 'blk\\.[0-9]+\\.attn_output\\.weight=rq4' \\
+llama-quantize --tensor-type 'blk\.[0-9]+\.(attn_qkv|attn_v|ffn_down)\.weight=q5_K' \
+               --tensor-type 'blk\.[0-9]+\.attn_output\.weight=rq4' \
                model-f16.gguf model-rq4rqmod.gguf RQ4_K_L 8
 ```
 
