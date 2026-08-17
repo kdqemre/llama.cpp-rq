@@ -26,7 +26,7 @@ The step $s$ is set by the **range**, not by where the values actually live.
 
 **Toy example ($b=4$, block of 4),** $\mathbf w = [1,\ 2,\ 3,\ 100\]$:
 
-$$s = \tfrac{100-1}{15} = 6.60 \;\Rightarrow\; \mathbf q = [0,\; 0,\; 0,\ 15] \;\Rightarrow\; \hat{\mathbf w} = [\,1,\; 1,\; 1,\; 100\,]$$
+$$s = \tfrac{100-1}{15} = 6.60 \;\Rightarrow\; \mathbf q = [0,\ 0,\ 0,\ 15] \;\Rightarrow\; \hat{\mathbf w} = [1,\ 1,\ 1,\ 100]$$
 
 | element | 1 | 2 | 3 | 100 |
 |---|---:|---:|---:|---:|
