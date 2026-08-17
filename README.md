@@ -147,12 +147,6 @@ llama-cli -m model-rq3.gguf -ngl 99 -t 8 -n 80 --temp 0.0 \
 | RQ2_K_L | 3.70 | 12.0 GB | 93 | 34.7 |
 | **RQ2_K_L-rqmod** | 3.70 | 12.0 GB | **98** | 32.3 |
 | Q2_K | 3.18 | 10.1 GB | 91 | 28.2 |
-| RQ3_K_L | 4.33 | 13.8 GB | 97 | 25.8 |
-| RQ3_K_L-rqmod | 4.28 | 13.6 GB | 98 | 23.7 |
-| Q3_K_M | 3.95 | 12.6 GB | 97 | 26.1 |
-| RQ4_K_L | 5.25 | 16.7 GB | 97 | 26.6 |
-| RQ4_K_L-rqmod | 4.91 | 15.6 GB | 97 | 29.8 |
-| Q4_K_M | 4.92 | 15.6 GB | 97 | 31.7 |
 | Q5_K_M | 5.72 | 18.2 GB | 98 | 29.2 |
 
 Harness: canonical 8-shot CoT primer, plain greedy (temp 0, seed 0), ctx 8192, n_predict 4096, KV q8_0, `stop=["####"]`, RTX 4090.
