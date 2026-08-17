@@ -63,15 +63,31 @@ The spike's energy is now spread over all four coordinates, which all quantize a
 | **rotated** | {−6,−5,5,6,7} — even | 2.40 | **1.86** | errors ≤ ~1.2, uniform |
 
 # TEST
-The spike's energy is now spread over all coordinates, allowing the quantizer to use its codebook efficiently. 
+The transform preserves the L2 norm and **dilutes spikes**. The spike's energy is now spread over all coordinates, which all quantize at comparable magnitude — the codebook is used evenly.
 
-Let's look at the actual reconstruction of a sparse-outlier block ($b=4$, block of 8) before and after WHT:
-**Original Weights:** `[0.5,  1.0,  1.5,  2.0,  1.0,  3.0,  2.0,  40.0]` *(Notice the 40.0 outlier)*
+Let's see the exact same visual comparison for a sparse-outlier case ($b=4$, block of 8). Notice how the single `40.0` outlier destroys the standard quantizer, but WHT saves the block:
 
-| Method | 4-bit Codebook Usage | What happens to the "Ordinary" values? | Resulting Information |
-| :--- | :--- | :--- | :--- |
-| **Standard (Q4)** | **Collapsed:** `{0, 1, 15}`<br>*(13 out of 16 codes are wasted)* | `1.0` is crushed to `0.5` **(-50% error)**<br>`2.0` is distorted to `3.13` **(+57% error)** | **Destroyed.** The outlier's gravity crushes the fine details into zero or random noise. |
-| **Rotated (RQ4)** | **Even:** `{−6, −5, 5, 6, 7}`<br>*(Codes are fully utilized)* | Errors are distributed uniformly (≤ 1.2).<br>Original patterns are preserved. | **Saved.** The outlier's energy is shared, reducing the overall L2 error significantly. |
+$\mathbf{w} = [0.5,\ 1.0,\ 1.5,\ 2.0,\ 1.0,\ 3.0,\ 2.0,\ 40.0]$
+
+**1. Standard Q4 (Collapse):**
+*(Step $s = 2.63$)*
+
+| element | 0.5 | 1.0 | 1.5 | 2.0 | 1.0 | 3.0 | 2.0 | 40.0 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| quantized | 0.50 | **0.50** | **0.50** | **3.13** | **0.50** | **3.13** | **3.13** | 40.00 |
+| relative error | 0% | **−50%** | **−67%** | **+57%** | **−50%** | **+4%** | **+57%** | 0% |
+
+> **Result:** Information is destroyed. The `1.0` and `1.5` values are crushed into `0.5`. The `2.0` and `3.0` values are distorted into `3.13`. 
+
+**2. Rotated RQ4 (Preserved):**
+*(Step $s = 2.40$)*
+
+| element | 0.5 | 1.0 | 1.5 | 2.0 | 1.0 | 3.0 | 2.0 | 40.0 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| quantized | 0.28 | **1.34** | **1.25** | **1.83** | **0.77** | **2.91** | **2.04** | 39.51 |
+| relative error | −44% | **+34%** | **−16%** | **−8%** | **−23%** | **−3%** | **+2%** | −1% |
+
+> **Result:** No collapse! Every original value gets a distinct, proportional representation instead of being rounded to the same bucket. The massive outlier is slightly softened to `39.51`, paying for the survival of the other 7 elements. Overall L2 error drops from `2.02` to `1.86`.
 # TEST
 
 The full pipeline, per sub-block at any bit width:
