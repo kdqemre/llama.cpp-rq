@@ -63,31 +63,57 @@ The spike's energy is now spread over all four coordinates, which all quantize a
 | **rotated** | {−6,−5,5,6,7} — even | 2.40 | **1.86** | errors ≤ ~1.2, uniform |
 
 # TEST
-The transform preserves the L2 norm and **dilutes spikes**. The spike's energy is now spread over all coordinates, which all quantize at comparable magnitude — the codebook is used evenly.
+## Why does this repository exist?
 
-Let's see the exact same visual comparison for a sparse-outlier case ($b=4$, block of 8). Notice how the single `40.0` outlier destroys the standard quantizer, but WHT saves the block:
+LLM weight matrices contain **outliers** — a few weights 10–100× larger than the rest. Block quantization divides its codebook by the block's range, so one outlier inflates the step size for everyone, and the ordinary values collapse onto the lowest codes. At 2 bits (4 levels) this destroys the block's information entirely.
 
-$\mathbf{w} = [0.5,\ 1.0,\ 1.5,\ 2.0,\ 1.0,\ 3.0,\ 2.0,\ 40.0]$
+### Standard block quantization (any bit width $b$)
 
-**1. Standard Q4 (Collapse):**
-*(Step $s = 2.63$)*
+For a block $\mathbf{w} \in \mathbb{R}^B$:
+
+$$s = \frac{w_{\max} - w_{\min}}{2^b - 1}$$
+$$q_i = \text{round}\left(\frac{w_i - w_{\min}}{s}\right)$$
+$$\hat{w}_i = w_{\min} + q_i s$$
+
+The step $s$ is set by the **range**, not by where the values actually live. 
+
+**Toy example ($b=4$, block of 8),** let's take a block with a single massive outlier: 
+$\mathbf{w} = [0.5, 1.0, 1.5, 2.0, 1.0, 3.0, 2.0, 40.0]$
+
+$$s = \frac{40.0 - 0.5}{15} = 2.63$$
 
 | element | 0.5 | 1.0 | 1.5 | 2.0 | 1.0 | 3.0 | 2.0 | 40.0 |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
 | quantized | 0.50 | **0.50** | **0.50** | **3.13** | **0.50** | **3.13** | **3.13** | 40.00 |
 | relative error | 0% | **−50%** | **−67%** | **+57%** | **−50%** | **+4%** | **+57%** | 0% |
 
-> **Result:** Information is destroyed. The `1.0` and `1.5` values are crushed into `0.5`. The `2.0` and `3.0` values are distorted into `3.13`. 
+The ordinary values collapse entirely. 13 of the 16 available codes are wasted on the empty space leading up to the outlier. The $1.0$ and $1.5$ values are crushed into $0.5$, and the $2.0$ values are distorted into $3.13$. The block's fine details are destroyed.
 
-**2. Rotated RQ4 (Preserved):**
-*(Step $s = 2.40$)*
+### Rotated quantization (this repo)
+
+The Walsh–Hadamard matrix (Sylvester construction) is orthogonal up to scale:
+
+$$H_2 = \begin{pmatrix} 1 & 1 \\ 1 & -1 \end{pmatrix}, \quad H_{2n} = H_n \otimes H_2, \quad H_n H_n^\top = nI$$
+
+RQ rotates every 32-weight sub-block with a **signed** WHT — a per-lane sign diagonal $D = \text{diag}(\pm 1)$ followed by the fast butterfly:
+
+$$\mathbf{x}' = \frac{1}{\sqrt{32}} H_{32} D \mathbf{x}$$
+$$\|\mathbf{x}'\| = \|\mathbf{x}\|$$
+
+The transform preserves the L2 norm and **dilutes spikes**. The spike's energy is spread over all coordinates, allowing the quantizer to use its codebook efficiently. 
+
+Let's apply WHT to the exact same block ($b=4$, step becomes $s = 2.40$):
 
 | element | 0.5 | 1.0 | 1.5 | 2.0 | 1.0 | 3.0 | 2.0 | 40.0 |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
 | quantized | 0.28 | **1.34** | **1.25** | **1.83** | **0.77** | **2.91** | **2.04** | 39.51 |
 | relative error | −44% | **+34%** | **−16%** | **−8%** | **−23%** | **−3%** | **+2%** | −1% |
 
-> **Result:** No collapse! Every original value gets a distinct, proportional representation instead of being rounded to the same bucket. The massive outlier is slightly softened to `39.51`, paying for the survival of the other 7 elements. Overall L2 error drops from `2.02` to `1.86`.
+**Result:** No collapse! Every original value gets a distinct, proportional representation instead of being rounded to the same bucket. The massive outlier is slightly softened to $39.51$, paying for the survival of the other 7 elements. Overall L2 error drops from $2.02$ to $1.86$.
+
+The full pipeline, per sub-block at any bit width:
+
+$$\hat{\mathbf{w}} = \frac{1}{\sqrt{32}} H_{32} \mathcal{Q}^{-1}\left(\mathcal{Q}_b\left(\frac{1}{\sqrt{32}} H_{32} D \mathbf{w}\right)\right)$$
 # TEST
 
 The full pipeline, per sub-block at any bit width:
