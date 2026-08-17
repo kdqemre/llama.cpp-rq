@@ -4,9 +4,9 @@ A fork of [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) (ggml 0.19
 
 | type | ggml ftype | block layout | nominal | measured @ Qwen3.8-27B |
 |---|---:|---|---:|---:|
-| `RQ2_K_L` | 49 | 80 B / 256 weights | 2.50 bpw | **3.70 bpw, 12.0 GB** |
-| `RQ3_K_L` | 48 | 112 B / 256 weights | 3.50 bpw | **4.33 bpw, 14.1 GB** |
-| `RQ4_K_L` | 47 | 144 B / 256 weights (byte-identical to `block_q4_K`) | 4.50 bpw | **5.25 bpw, 17.1 GB** |
+| `RQ2_K_L` | 49 | 80 B / 256 weights | 2.50 bpw | **3.70 bpw, 12.6 GB** |
+| `RQ3_K_L` | 48 | 112 B / 256 weights | 3.50 bpw | **4.33 bpw, 14.8 GB** |
+| `RQ4_K_L` | 47 | 144 B / 256 weights (byte-identical to `block_q4_K`) | 4.50 bpw | **5.25 bpw, 17.9 GB** |
 
 One idea powers all three: **before quantizing, every 32-weight sub-block is rotated by a signed Walsh–Hadamard transform.** The rotation spreads outlier energy evenly across the sub-block, so t[...]
 
