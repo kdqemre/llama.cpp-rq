@@ -47,7 +47,7 @@ $$\mathbf x' = \tfrac{1}{\sqrt{32}}\, H_{32}\, D\, \mathbf x, \qquad \lVert \mat
 
 The transform preserves the L2 norm and **dilutes spikes**. Same toy block (shown with $H_4$ for readability):
 
-$$\tfrac{1}{2}H_4\,[\,1,2,3,100\,] = [\,53,\; -49,\; -50,\; 48\,]$$
+$$\tfrac{1}{2}H_4\,[1,2,3,100] = [53,\ -49,\ -50,\ 48]$$
 
 The spike's energy is now spread over all four coordinates, which all quantize at comparable magnitude — the codebook is used evenly. Sparse-outlier case ($b=4$, block of 8), $\mathbf w = [\,0.5[...]
 
