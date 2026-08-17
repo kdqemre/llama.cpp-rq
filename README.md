@@ -71,7 +71,11 @@ LLM weight matrices contain **outliers** — a few weights 10–100× larger tha
 
 For a block $\mathbf{w} \in \mathbb{R}^B$:
 
-$$\begin{aligned}s &= \frac{w_{\max} - w_{\min}}{2^b - 1} \\ q_i &= \text{round}\left(\frac{w_i - w_{\min}}{s}\right) \\ \hat{w}_i &= w_{\min} + q_i s\end{aligned}$$
+$$s = \frac{w_{\max} - w_{\min}}{2^b - 1}$$
+
+$$q_i = \text{round}\left(\frac{w_i - w_{\min}}{s}\right)$$
+
+$$\hat{w}_i = w_{\min} + q_i s$$
 
 The step $s$ is set by the **range**, not by where the values actually live.
 
@@ -85,17 +89,23 @@ $$s = \frac{40.0 - 0.5}{15} = 2.63 \implies \mathbf{q} = [0, 0, 0, 1, 0, 1, 1, 1
 | quantized | 0.50 | **0.50** | **0.50** | **3.13** | **0.50** | 3.13 | **3.13** | 40.00 |
 | relative error | 0% | **−50%** | **−67%** | **+57%** | **−50%** | +4% | **+57%** | 0% |
 
-The ordinary values collapse: the $1.0$s and $1.5$ are crushed into $0.5$, the $2.0$s are distorted into $3.13$ — 13 of the 16 codes are wasted on the empty space leading up to the outlier. At $b=2$ the same block is worse still: $s = 13.17$, and everything but the outlier maps to a single level.
+The ordinary values collapse: the 1.0s and 1.5 are crushed into 0.5, the 2.0s are distorted into 3.13 — 13 of the 16 codes are wasted on the empty space leading up to the outlier. At $b=2$ the same block is worse still: $s = 13.17$, and everything but the outlier maps to a single level.
 
 ### Rotated quantization (this repo)
 
 The Walsh–Hadamard matrix (Sylvester construction) is orthogonal up to scale:
 
-$$\begin{aligned}H_2 &= \begin{pmatrix} 1 & 1 \\ 1 & -1 \end{pmatrix} \\ H_{2n} &= H_n \otimes H_2 \\ H_n H_n^\top &= nI\end{aligned}$$
+$$H_2 = \begin{pmatrix} 1 & 1 \\ 1 & -1 \end{pmatrix}$$
+
+$$H_{2n} = H_n \otimes H_2$$
+
+$$H_n H_n^\top = nI$$
 
 RQ rotates every 32-weight sub-block with a **signed** WHT — a per-lane sign diagonal $D = \text{diag}(\pm 1)$ followed by the fast butterfly:
 
-$$\begin{aligned}\mathbf{x}' &= \frac{1}{\sqrt{32}} H_{32} D \mathbf{x} \\ \|\mathbf{x}'\| &= \|\mathbf{x}\|\end{aligned}$$
+$$\mathbf{x}' = \frac{1}{\sqrt{32}} H_{32} D \mathbf{x}$$
+
+$$\|\mathbf{x}'\| = \|\mathbf{x}\|$$
 
 The transform preserves the L2 norm and **dilutes spikes**. Apply it to the exact same block ($H_8$ shown for readability):
 
@@ -108,7 +118,7 @@ The outlier's energy is now spread across **all eight** coordinates — no singl
 | quantized | 1.17 | **0.77** | 0.77 | **2.30** | **0.77** | 2.30 | **2.30** | 40.63 |
 | relative error | +134% | **−23%** | −49% | **+15%** | **−23%** | −23% | **+15%** | +2% |
 
-The mid-range values stop being systematically crushed — the $2.0$s land at $2.30$ ($+15\%$) instead of $3.13$ ($+57\%$), the $1.0$s at $0.77$ ($-23\%$) instead of $0.50$ ($-50\%$), and the outlier survives intact ($40.0 \to 40.63$). The cost concentrates on the single smallest value ($0.5 \to 1.17$) and the $1.5$ ($-49\%$). Errors become **proportional to magnitude** instead of a collapse pattern, and the block's L2 error drops $2.02 \to 1.47$ ($-27\%$) with the same 4-bit budget.
+The mid-range values stop being systematically crushed — the 2.0s land at 2.30 (+15%) instead of 3.13 (+57%), the 1.0s at 0.77 (−23%) instead of 0.50 (−50%), and the outlier survives intact (40.0 -> 40.63). The cost concentrates on the single smallest value (0.5 -> 1.17) and the 1.5 (−49%). Errors become **proportional to magnitude** instead of a collapse pattern, and the block's L2 error drops 2.02 -> 1.47 (−27%) with the same 4-bit budget.
 
 The full pipeline, per sub-block at any bit width:
 
