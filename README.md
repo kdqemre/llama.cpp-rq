@@ -38,7 +38,7 @@ $$s = \frac{40.0 - 0.5}{15} = 2.63 \implies \mathbf{q} = [0, 0, 0, 1, 0, 1, 1, 1
 | quantized | 0.50 | **0.50** | **0.50** | **3.13** | **0.50** | 3.13 | **3.13** | 40.00 |
 | relative error | 0% | **−50%** | **−67%** | **+57%** | **−50%** | +4% | **+57%** | 0% |
 
-The ordinary values collapse: the 1.0s and 1.5 are crushed into 0.5, the 2.0s are distorted into 3.13 — 13 of the 16 codes are wasted on the empty space leading up to the outlier. At $b=2$ the same block is worse still: $s = 13.17$, and everything but the outlier maps to a single level.
+The ordinary values collapse: 1.0s and 1.5 are crushed into 0.5, the 2.0s are distorted into 3.13 — 13 of the 16 codes are wasted on the empty space leading up to the outlier. At $b=2$ the same block is worse still: $s = 13.17$, and everything but the outlier maps to a single level.
 
 ### Rotated quantization (this repo)
 
