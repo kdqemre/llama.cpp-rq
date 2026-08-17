@@ -97,8 +97,6 @@ The Walsh–Hadamard matrix (Sylvester construction) is orthogonal up to scale:
 
 $$H_2 = \begin{pmatrix} 1 & 1 \\\\ 1 & -1 \end{pmatrix}$$
 
-$$H_2 = \begin{pmatrix} 1 & 1 \\ 1 & -1 \end{pmatrix}$$
-
 $$H_{2n} = H_n \otimes H_2$$
 
 $$H_n H_n^\top = nI$$
