@@ -77,8 +77,8 @@ At inference the standard K-quant scale/index machinery applies unchanged; the r
 
 A toy block can't show the whole picture — the payoff is statistical. Across a real matrix, outlier coordinates are sparse; rotation guarantees every sub-block absorbs an equal slice of every outlier, so no block's step is blown and the error is isotropic instead of a systematic bias on common values. Measured at 27B scale (GSM8K-100, one harness for all rows):
 
-> **Qwen3.6-27B, 0-shot, MTP:** RQ2_K_L **92** vs Q2_K **64** (+28) · RQ3_K_L-rqmod **97** vs Q3_K_M 93 · RQ4_K_L-rqmod 88 vs Q4_K_M 89
-> **Qwen3.8-27B, 8-shot, MTP-off:** RQ2_K_L 93 vs Q2_K 91 · RQ2_K_L-rqmod **98** · 3-bit tier: RQ3_K_L 97 = Q3_K_M 97 · 4-bit tier: RQ4_K_L 97 = Q4_K_M 97
+ **Qwen3.6-27B, 0-shot, MTP:** RQ2_K_L **92** vs Q2_K **64** (+28) · RQ3_K_L-rqmod **97** vs Q3_K_M 93 · RQ4_K_L-rqmod 88 vs Q4_K_M 89
+ **Qwen3.8-27B, 8-shot, MTP-off:** RQ2_K_L 93 vs Q2_K 91 · RQ2_K_L-rqmod **98** · 3-bit tier: RQ3_K_L 97 = Q3_K_M 97 · 4-bit tier: RQ4_K_L 97 = Q4_K_M 97
 
 **Honest scoping:** rotation helps where bits are scarce (2/3/4). At 5 bits the error-spreading that makes rotation great at low bits starts hurting exact multi-step arithmetic (a few natural-domain weights absorb a large aggregated error) — we built RQ5, measured it winning PPL but losing GSM8K, and stopped there. That is why this repo ships RQ2/RQ3/RQ4.
 
