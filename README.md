@@ -135,6 +135,40 @@ llama-cli -m model-rq3.gguf -ngl 99 -t 8 -n 80 --temp 0.0 \
   -p "Q: ...\nA:" -no-cnv --single-turn
 ```
 
+### NVFP4 (NVIDIA FP4 — E2M1 + E4M3 block scales)
+
+NVFP4 is a first-class type (`NVFP4`, ggml type 40, ftype 39): 64-element blocks of
+4-bit E2M1 codes (16 values: 0, ±0.5, ±1, ±1.5, ±2, ±3, ±4, ±6) with one FP8 E4M3
+scale per 16-element sub-block, 4.5 bpw. On non-Blackwell GPUs (RTX 4090 etc.) it runs
+through the software-emulated int8 dp4a path; Blackwell (sm_100+) uses the native FP4
+tensor-core path.
+
+```bash
+# standard recipe — every 2d/3d weight tensor -> NVFP4 (1d tensors stay f32)
+llama-quantize model-f16.gguf model-nvfp4.gguf NVFP4 8
+
+# modular — mix NVFP4 with the RQ types per tensor group (same regex mechanism as the RQ formats)
+llama-quantize --tensor-type 'blk\.[0-9]+\.ffn_(gate|up)\.weight=nvfp4' \
+               --tensor-type 'blk\.[0-9]+\.attn_qkv\.weight=rq3' \
+               model-f16.gguf model-mixed.gguf RQ4_K_L 8
+```
+
+Server — same flags as any other type; MTP works on the NVFP4 tensors too:
+
+```bash
+# plain greedy
+llama-server -m model-nvfp4.gguf -ngl 99 -c 8192 -t 8 -fa on \
+  --jinja --reasoning off --temp 0.0 \
+  --cache-type-k q8_0 --cache-type-v q8_0
+
+# MTP (models with blk.64.nextn heads): verified at Q4_K_M-MTP parity
+llama-server -m model-nvfp4.gguf ... --spec-type draft-mtp --spec-draft-n-max 3
+```
+
+Measured on Qwen3.8-27B (RTX 4090, same-session A/B): 14.33 GiB, GSM8K-100
+94/100, decode 38.9 t/s vs Q4_K_M 34.2 (+13.7%) and RQ4-rqmod 32.7 (+19.0%);
+MTP decode 68.9 t/s (tied with Q4_K_M-MTP), 74.5% draft acceptance.
+
 ### What's inside (speed & quality work)
 
 - **Optimized rotation-sign search** — the $D$ diagonal is not random: offline sweeps over sign patterns (70+ candidates) move wikitext PPL by up to **1.4 points**; per-category diagonals add up to another −0.85. The winning patterns are baked in as defaults, so quantization is deterministic and fast.
