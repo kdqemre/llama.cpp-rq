@@ -69,6 +69,7 @@ static const std::vector<quant_option> QUANT_OPTIONS = {
     { "RQ4_K_L",  LLAMA_FTYPE_MOSTLY_RQ4_K_L, " 4.50 bpw Rotated Quant 4-bit Large", },
     { "RQ3_K_L",  LLAMA_FTYPE_MOSTLY_RQ3_K_L, " 3.50 bpw Rotated Quant 3-bit Large", },
     { "RQ2_K_L",  LLAMA_FTYPE_MOSTLY_RQ2_K_L, " 2.50 bpw Rotated Quant 2-bit Large", },
+    { "NVFP4",    LLAMA_FTYPE_MOSTLY_NVFP4,   " 4.50 bpw NVIDIA FP4 (E2M1 + E4M3 block scales)", },
     { "Q8_0",     LLAMA_FTYPE_MOSTLY_Q8_0,     " 7.96G, +0.0026 ppl @ Llama-3-8B",  },
     { "F16",      LLAMA_FTYPE_MOSTLY_F16,      "14.00G, +0.0020 ppl @ Mistral-7B",  },
     { "BF16",     LLAMA_FTYPE_MOSTLY_BF16,     "14.00G, -0.0050 ppl @ Mistral-7B",  },

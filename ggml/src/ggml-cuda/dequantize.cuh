@@ -450,3 +450,25 @@ static __device__ __forceinline__ void dequantize_mxfp4(const void * vx, const i
         y[j+16] = ggml_cuda_cast<dst_t>(d * kvalues_mxfp4[q4[j] >>  4]*0.5f);
     }
 }
+
+template<typename dst_t>
+static __device__ __forceinline__ void dequantize_nvfp4(const void * vx, const int64_t ibs, dst_t * yy, const int tid) {
+
+    // block_nvfp4 = 64 elems: 4x UE4M3 sub-scales (16-elem sub-blocks) + 32 B E2M1 nibbles.
+    // 256-elem chunk = 4 blocks; 32 threads -> thread (il, ib): il = sub-block 0..3,
+    // ib = block-pair half 0..1 of block ib>>1. 8 elems per thread.
+    const block_nvfp4 * x = (const block_nvfp4 *) vx + ibs*(QK_K/QK_NVFP4);
+
+    const int64_t il = tid/8; // 0...3  (16-elem sub-block within a 64-block)
+    const int64_t ib = tid%8; // 0...7  (block = ib>>1, half = ib&1)
+    const int64_t b  = ib >> 1;
+    const int64_t h  = ib & 1;
+
+    const float d = ggml_cuda_ue4m3_to_fp32(x[b].d[il]);
+    const uint8_t  * q4 = x[b].qs + il*8 + 4*h; // 4 bytes = 8 nibbles
+    dst_t * y = yy + 64*b + 16*il + 8*h;
+    for (int j = 0; j < 4; ++j) {
+        y[j+0] = ggml_cuda_cast<dst_t>(d * kvalues_mxfp4[q4[j] & 0x0F]);
+        y[j+4] = ggml_cuda_cast<dst_t>(d * kvalues_mxfp4[q4[j] >>  4]);
+    }
+}
