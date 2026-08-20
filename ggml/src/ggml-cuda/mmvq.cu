@@ -9,6 +9,15 @@
 #include "vecdotq.cuh"
 
 #include <cstdint>
+#include <cstdlib>
+
+// Default OFF: RQ3/RQ4 decode (ncols==1) uses generic mul_mat_vec_q (multi-row
+// blocks). The specialized 1-row kernels remain behind RQ_SPECIALIZED_NCOLS1=1
+// for A/B. Same vec_dot math; different reduction order. See §47.4/§47.5.
+static bool rq_use_specialized_ncols1() {
+    const char * e = getenv("RQ_SPECIALIZED_NCOLS1");
+    return e != nullptr && e[0] == '1' && e[1] == '\0';
+}
 
 typedef float (*vec_dot_q_cuda_t)(const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs);
 
@@ -1751,10 +1760,9 @@ void ggml_cuda_mul_mat_vec_q(
 
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
 
-    // RQ4 specialized ncols==1 dp4a decode kernel (fused-GLU + single-col). Faster than
-    // the generic Phase-1 vec_dot_rq4_q8_1_rot path; rejects non-RQ4 / ids / ncols>1,
-    // which then fall through to mul_mat_vec_q_switch_type below.
-    if (!ids && ncols_dst == 1 &&
+    // RQ4 specialized ncols==1 kernel: opt-in via RQ_SPECIALIZED_NCOLS1=1.
+    // Default is generic mul_mat_vec_q (multi-row); same rot-dot math.
+    if (rq_use_specialized_ncols1() && !ids && ncols_dst == 1 &&
         try_mul_mat_vec_rq4_q8_1_ncols1(
             src0->data, src0->type, src1_q8_1.get(),
             nullptr, fusion_local, dst_d, ne00, ne01, s01, stride_col_y, stride_col_dst,
@@ -1763,9 +1771,8 @@ void ggml_cuda_mul_mat_vec_q(
         return;
     }
 
-    // RQ3 specialized ncols==1 dp4a decode kernel; rejects non-RQ3 / ids / ncols>1,
-    // which then fall through to mul_mat_vec_q_switch_type below.
-    if (!ids && ncols_dst == 1 &&
+    // RQ3 specialized ncols==1 kernel: same opt-in as RQ4.
+    if (rq_use_specialized_ncols1() && !ids && ncols_dst == 1 &&
         try_mul_mat_vec_rq3_q8_1_ncols1(
             src0->data, src0->type, src1_q8_1.get(),
             nullptr, fusion_local, dst_d, ne00, ne01, s01, stride_col_y, stride_col_dst,
@@ -1828,9 +1835,8 @@ void ggml_cuda_op_mul_mat_vec_q(
         const int stride_col_y = src1_padded_row_size / QK8_1;
 
         ggml_cuda_mm_fusion_args_device fusion_local{};
-        // RQ4/RQ3 specialized ncols==1 dp4a decode kernel (single-column path). Falls
-        // through to the generic vec_dot path when src1_ncols > 1.
-        if (src1_ncols == 1) {
+        // Specialized ncols==1: opt-in RQ_SPECIALIZED_NCOLS1=1. Default generic.
+        if (rq_use_specialized_ncols1() && src1_ncols == 1) {
             if (is_rq4 &&
                 try_mul_mat_vec_rq4_q8_1_ncols1(
                     src0_dd_i, src0->type, src1_q8_1.get(),
