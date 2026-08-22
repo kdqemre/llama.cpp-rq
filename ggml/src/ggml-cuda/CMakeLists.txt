@@ -251,6 +251,17 @@ if (CUDAToolkit_FOUND)
 
     if (NOT MSVC)
         list(APPEND CUDA_CXX_FLAGS -Wno-pedantic)
+        # Workaround: gcc >= 13 SLP-vectorizer ICEs (segfault) on the huge generated
+        # CUDA host stubs (mmq/fattn template instances). Disable the crashing pass.
+        execute_process(
+            COMMAND ${CMAKE_CUDA_COMPILER} .c -Xcompiler -dumpversion
+            OUTPUT_VARIABLE CUDA_HOST_CCVER
+            ERROR_QUIET
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+        )
+        if (CUDA_HOST_CCVER MATCHES "^1[34]")
+            list(APPEND CUDA_CXX_FLAGS -fno-tree-slp-vectorize)
+        endif()
     else()
         # CCCL 3.2 onwards will require a cpp-standard-compliant preprocessor for MSVC
         # https://github.com/NVIDIA/cccl/pull/6827
