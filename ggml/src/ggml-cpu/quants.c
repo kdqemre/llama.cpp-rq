@@ -1408,6 +1408,26 @@ void ggml_vec_dot_rq4_f32(int n, float * GGML_RESTRICT s, size_t bs, const void 
     *s = sumf;
 }
 
+// RQFP4: dequant-based F32 dot. dequantize_row_rqfp4 inverse-rotates the stored
+// WHT-domain coefficients back to the natural domain before the dot.
+void ggml_vec_dot_rqfp4_f32(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(nrc == 1);
+    UNUSED(nrc); UNUSED(bs); UNUSED(bx); UNUSED(by);
+
+    const block_rqfp4 * GGML_RESTRICT x = vx;
+    const float * GGML_RESTRICT y = vy;
+    const int nb = n / QK_RQFP4;
+    float sumf = 0.0f;
+
+    for (int i = 0; i < nb; ++i) {
+        float tmp[QK_RQFP4];
+        dequantize_row_rqfp4(x + i, tmp, QK_RQFP4);
+        const float * ay = y + i * QK_RQFP4;
+        for (int l = 0; l < QK_RQFP4; ++l) sumf += ay[l] * tmp[l];
+    }
+    *s = sumf;
+}
+
 // Extern: RQ3 sign pattern (defined in ggml-quants.c, env RQ3_SIGNS).
 extern const float * rq3_signs_ptr(void);
 extern const float RQ3_SIGNS[32];

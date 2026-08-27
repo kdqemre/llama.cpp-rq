@@ -159,6 +159,7 @@ extern "C" {
         LLAMA_FTYPE_MOSTLY_RQ4_K_L       = 47, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_RQ3_K_L       = 48, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_RQ2_K_L       = 49, // 2.50 bpw Rotated Quant 2-bit Large
+        LLAMA_FTYPE_MOSTLY_RQFP4         = 50, // Rotated FP4 (E2M1 + UE4M3, WHT) except 1d tensors
 
         LLAMA_FTYPE_GUESSED = 1024, // not specified in the model file
     };
@@ -436,6 +437,7 @@ extern "C" {
         bool pure;                                                  // quantize all tensors to the default type
         bool keep_split;                                            // quantize to the same number of shards
         bool dry_run;                                               // calculate and show the final quantization size without performing quantization
+        bool quant_stats;                                           // print per-tensor quantize/dequantize error statistics
         const struct llama_model_imatrix_data * imatrix;            // pointer to importance matrix data
         const struct llama_model_kv_override * kv_overrides;        // pointer to kv overrides
         const struct llama_model_tensor_override * tt_overrides;    // pointer to tensor overrides

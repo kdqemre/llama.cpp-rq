@@ -477,6 +477,54 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     }
 }
 
+// Used for RQFP4: like the q8_0_16 dp4a, but each 32-group carries its own
+// {scale, min} (x_df: d at 2*chunk, m at 2*chunk+1) and the min term uses the
+// per-32 activation sum from the y-tile's {d, s} half2s (the rq4 prep zeroes the
+// q8_1 ds.y, but the MMQ quantizer stores the rotated sum in the s field).
+template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_rqfp4_q8_1_dp4a(
+        const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int nwarps    = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
+    constexpr int I         = ggml_cuda_mmq_get_I(type, J, fallback);
+
+    constexpr tile_x_sizes txs = mmq_get_dp4a_tile_x_sizes(type, I);
+    const int   * x_qs = (const int   *) x;
+    const float * x_df = (const float *) x_qs + txs.qs;
+    const int   * y_qs = (const int   *) y + 4;
+    const half2 * y_ds = (const half2 *) y;
+
+    for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += QI8_0) {
+        // QI8_0 = 8 -> 4 x 32-value groups of the 128-value half (k01 = 8*g).
+        const int k0    = k00 + k01;
+        const int group = 4*(k00 >> 5) + (k01 >> 3); // x_df {d,m} pair: half offset (k00 = 0/MMQ_TILE_NE_K) + 32-group
+
+#pragma unroll
+        for (int j0 = 0; j0 < J; j0 += nwarps) {
+            const int j = j0 + threadIdx.y;
+
+#pragma unroll
+            for (int i0 = 0; i0 < I; i0 += warp_size) {
+                const int i = i0 + threadIdx.x;
+
+                int sumi = 0;
+#pragma unroll
+                for (int l = 0; l < 8; ++l) {
+                    sumi = ggml_cuda_dp4a(x_qs[i*(2*MMQ_TILE_NE_K + 1) + k0 + l],
+                                          y_qs[j*MMQ_TILE_Y_K + k01 + l], sumi);
+                }
+                // y-tile is reloaded per half (process_tile): its per-32 {d,s} half2s
+                // (RQFP4 uses the DS4 layout, so s = the rotated activation sum) sit at
+                // the row start; the x-tile holds both halves, so the {d,m} pair index
+                // must include the k00 half offset.
+                const half2 ds = y_ds[j*MMQ_TILE_Y_K + (k01 >> 3)];
+                const float d = x_df[i*16 + 2*group + 0];
+                const float m = x_df[i*16 + 2*group + 1];
+                sum[j0/nwarps*I/warp_size + i0/warp_size] += d * float(sumi) * __low2float(ds) - m * __high2float(ds);
+            }
+        }
+    }
+}
+
 // Used for Q3_K, IQ2_S, and IQ2_XS:
 template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q8_0_16_q8_1_mma(
         const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {

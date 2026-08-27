@@ -433,7 +433,8 @@ extern "C" {
         GGML_TYPE_RQ4 = 47, // Rotated Quant 4-bit Large with WHT + Lloyd-Max 16-level codebook (4.5 bpw)
         GGML_TYPE_RQ3 = 48, // Rotated Quant 3-bit Large with WHT + 3-bit scale+min (3.5 bpw)
         GGML_TYPE_RQ2 = 49, // Rotated Quant 2-bit Large with WHT + scale+min (2.5 bpw)
-        GGML_TYPE_COUNT   = 50,
+        GGML_TYPE_RQFP4 = 50, // Rotated FP4: E2M1 + per-16 UE4M3 scales, WHT-rotated + 4/6 adaptive (4.5 bpw)
+        GGML_TYPE_COUNT   = 51,
     };
 
     // precision

@@ -32,6 +32,7 @@ static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type) 
         case GGML_TYPE_Q8_0:    return vec_dot_q8_0_q8_1;
         case GGML_TYPE_MXFP4:   return vec_dot_mxfp4_q8_1;
         case GGML_TYPE_NVFP4:   return vec_dot_nvfp4_q8_1;
+        case GGML_TYPE_RQFP4:   return vec_dot_nvfp4_q8_1<true>; // RQFP4: rotated q8_1 activation, own lattice + FP16 scales
         case GGML_TYPE_Q2_K:    return vec_dot_q2_K_q8_1;
         case GGML_TYPE_Q3_K:    return vec_dot_q3_K_q8_1;
         case GGML_TYPE_Q4_K:    return vec_dot_q4_K_q8_1;
@@ -64,6 +65,7 @@ static constexpr __host__ __device__ int get_vdr_mmvq(ggml_type type) {
         case GGML_TYPE_Q8_0:    return VDR_Q8_0_Q8_1_MMVQ;
         case GGML_TYPE_MXFP4:   return VDR_MXFP4_Q8_1_MMVQ;
         case GGML_TYPE_NVFP4:   return VDR_NVFP4_Q8_1_MMVQ;
+        case GGML_TYPE_RQFP4:   return VDR_NVFP4_Q8_1_MMVQ;
         case GGML_TYPE_Q2_K:    return VDR_Q2_K_Q8_1_MMVQ;
         case GGML_TYPE_Q3_K:    return VDR_Q3_K_Q8_1_MMVQ;
         case GGML_TYPE_Q4_K:    return VDR_Q4_K_Q8_1_MMVQ;
@@ -144,6 +146,7 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_pascal_older(gg
         case GGML_TYPE_IQ4_XS:  return 5;
         case GGML_TYPE_MXFP4:   return 4;
         case GGML_TYPE_NVFP4:   return 4;
+        case GGML_TYPE_RQFP4:   return 4;
         case GGML_TYPE_Q2_K:    return 4;
         case GGML_TYPE_Q3_K:    return 4;
         case GGML_TYPE_Q4_0:    return 6;
@@ -165,6 +168,7 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_turing_plus(ggm
         case GGML_TYPE_IQ3_XXS: return 7;
         case GGML_TYPE_MXFP4:   return 7;
         case GGML_TYPE_NVFP4:   return 8;
+        case GGML_TYPE_RQFP4:   return 8;
         case GGML_TYPE_Q2_K:    return 7;
         case GGML_TYPE_Q3_K:    return 5;
         default:                return MMVQ_MAX_BATCH_SIZE;
@@ -252,6 +256,7 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_rdna4(ggml_type
         case GGML_TYPE_IQ4_XS:  return 5;
         case GGML_TYPE_MXFP4:   return 5;
         case GGML_TYPE_NVFP4:   return 5;
+        case GGML_TYPE_RQFP4:   return 5;
         case GGML_TYPE_Q3_K:    return 4;
         case GGML_TYPE_Q4_0:    return 7;
         case GGML_TYPE_Q4_1:    return 7;
@@ -1522,6 +1527,16 @@ static void mul_mat_vec_q_switch_type(
                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
                  nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
             break;
+        case GGML_TYPE_RQFP4:
+            // RQFP4: own 40-B block (per-32 {d,min} + uniform levels); MUST use the
+            // RQFP4-typed template so the kernel picks vec_dot_nvfp4_q8_1<true> from
+            // get_vec_dot_q_cuda. The NVFP4 template would use the plain E2M1+UE4M3
+            // vec_dot on the RQFP4 blocks (wrong decode => garbage).
+            mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_RQFP4>
+                (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
+                 nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
+            break;
         case GGML_TYPE_Q2_K:
             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_Q2_K>
                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
@@ -1709,19 +1724,27 @@ void ggml_cuda_mul_mat_vec_q(
 
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
     ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
-    if (src0->type == GGML_TYPE_RQ4 || src0->type == GGML_TYPE_RQ3 || src0->type == GGML_TYPE_RQ2) {
-        // RQ4/RQ3: forward-WHT-rotate the activation via the fused prep kernel (Kernel A):
+    if (src0->type == GGML_TYPE_RQ4 || src0->type == GGML_TYPE_RQ3 || src0->type == GGML_TYPE_RQ2 || src0->type == GGML_TYPE_RQFP4) {
+        // RQ4/RQ3/RQFP4: forward-WHT-rotate the activation via the fused prep kernel (Kernel A):
         // emits a layout-identical rotated q8_1 (ds.x = rotated scale, ds.y = 0) + an
         // FP32 Sa sidecar carrying the original block sum. vec_dot_rq{4,3}_q8_1_rot
         // (swapped in at get_vec_dot_q_cuda) dots the rotated q8 against the (already
         // rotated) stored weight levels. By WHT orthogonality <w_nat, a_nat> =
         // <w_rot, WHT(a_nat)> so the generic MMVQ path is correct for ALL ncols.
-        if (src0->type == GGML_TYPE_RQ4) ggml_cuda_rq4_init_signs(); else if (src0->type == GGML_TYPE_RQ3) ggml_cuda_rq3_init_signs(); else ggml_cuda_rq2_init_signs();
+        // RQFP4 uses the same rq4 sign pattern and the plain vec_dot_nvfp4_q8_1
+        // (the rotation lives entirely in the prep kernel + the baked weights).
+        if (src0->type == GGML_TYPE_RQ4 || src0->type == GGML_TYPE_RQFP4) {
+            ggml_cuda_rq4_init_signs();
+        } else if (src0->type == GGML_TYPE_RQ3) {
+            ggml_cuda_rq3_init_signs();
+        } else {
+            ggml_cuda_rq2_init_signs();
+        }
         ggml_cuda_pool_alloc<float> src1_sa(ctx.pool(), ne13*ne12*ne11*ne10_padded / QK8_1);
         const int64_t s11 = src1->nb[1] / ts_src1;
         const int64_t s12 = src1->nb[2] / ts_src1;
         const int64_t s13 = src1->nb[3] / ts_src1;
-        if (src0->type == GGML_TYPE_RQ4) {
+        if (src0->type == GGML_TYPE_RQ4 || src0->type == GGML_TYPE_RQFP4) {
             ggml_cuda_rq4_prep_act(src1_d, (block_q8_1 *) src1_q8_1.get(), src1_sa.get(),
                                        ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
         } else if (src0->type == GGML_TYPE_RQ3) {
@@ -1808,11 +1831,11 @@ void ggml_cuda_op_mul_mat_vec_q(
     // nrows_dst == nrows of the matrix that the kernel writes into
     const int64_t nrows_dst = id == ctx.device ? ne0 : row_diff;
 
-    if (src0->type == GGML_TYPE_RQ4 || src0->type == GGML_TYPE_RQ3 || src0->type == GGML_TYPE_RQ2) {
-        // RQ4/RQ3: src1_ddq_i was quantized without the forward-WHT rotation; re-quantize
+    if (src0->type == GGML_TYPE_RQ4 || src0->type == GGML_TYPE_RQ3 || src0->type == GGML_TYPE_RQ2 || src0->type == GGML_TYPE_RQFP4) {
+        // RQ4/RQ3/RQFP4: src1_ddq_i was quantized without the forward-WHT rotation; re-quantize
         // from the FP32 source via the fused prep kernel (rotated q8_1 + FP32 Sa sidecar)
         // so vec_dot_rq{4,3}_q8_1_rot in the generic MMVQ path is correct.
-        const bool is_rq4 = (src0->type == GGML_TYPE_RQ4);
+        const bool is_rq4 = (src0->type == GGML_TYPE_RQ4 || src0->type == GGML_TYPE_RQFP4);
         const bool is_rq2 = (src0->type == GGML_TYPE_RQ2);
         if (is_rq4) ggml_cuda_rq4_init_signs(); else if (is_rq2) ggml_cuda_rq2_init_signs(); else ggml_cuda_rq3_init_signs();
         ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(id), src1_ncols * src1_padded_row_size * sizeof(block_q8_1)/QK8_1);

@@ -1,5 +1,6 @@
 #include "common.cuh"
 #include "convert.cuh"
+#include "rq4-signs.cuh"
 
 static __device__ __forceinline__ void dequantize_q1_0(const void * vx, const int64_t ib, const int iqs, float2 & v){
     const block_q1_0 * x = (const block_q1_0 *) vx;
@@ -470,5 +471,31 @@ static __device__ __forceinline__ void dequantize_nvfp4(const void * vx, const i
     for (int j = 0; j < 4; ++j) {
         y[j+0] = ggml_cuda_cast<dst_t>(d * kvalues_mxfp4[q4[j] & 0x0F]);
         y[j+4] = ggml_cuda_cast<dst_t>(d * kvalues_mxfp4[q4[j] >>  4]);
+    }
+}
+
+template <typename dst_t>
+static __device__ __forceinline__ void dequantize_rqfp4(const void * vx, const int64_t ibs, dst_t * yy, const int tid) {
+    // RQFP4: 64-elem block = 2 x 32-groups of uniform 16 levels (d*L - min) with
+    // an inverse sign-flipped WHT per 32-group (matches dequantize_block_rqfp4 and
+    // the CPU's dequantize_row_rqfp4). 32 threads per 256-elem chunk -> 8 groups,
+    // one full-warp shuffle-WHT per group (needs ggml_cuda_rq4_init_signs()).
+    const block_rqfp4 * x = (const block_rqfp4 *) vx + ibs*(QK_K/QK_RQFP4);
+    static constexpr float inv_sqrt32 = 0.1767766952966369f; // 1/sqrt(32)
+#pragma unroll
+    for (int g = 0; g < 8; ++g) {
+        const block_rqfp4 & xb = x[g >> 1];
+        const int h = g & 1;
+        const float d = __half2float(*reinterpret_cast<const __half *>(&xb.d[h]));
+        const float m = __half2float(*reinterpret_cast<const __half *>(&xb.dmin[h]));
+        const uint8_t b = xb.qs[16*h + tid/2];
+        const uint8_t L = (tid & 1) ? (b >> 4) : (b & 0x0F);
+        float val = d*(float) L - m;
+#pragma unroll
+        for (int step = 1; step < 32; step <<= 1) {
+            const float other = __shfl_xor_sync(0xFFFFFFFF, val, step, 32);
+            val = (tid & step) ? (other - val) : (other + val);
+        }
+        yy[32*g + tid] = ggml_cuda_cast<dst_t>(val * inv_sqrt32 * ggml_cuda_rq4_signs_dev[tid]);
     }
 }

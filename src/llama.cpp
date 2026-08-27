@@ -295,6 +295,14 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
         }
     }
 
+    // no GPU layers requested -> run everything on the CPU. Keeping the GPU device
+    // in the list makes the scheduler reserve a GPU compute buffer and execute part
+    // of the graph on the device with CPU-resident weights, which corrupts the
+    // hybrid (SSM/conv/state) ops for RQFP4-sized models (long-context NaNs).
+    if (params.n_gpu_layers == 0) {
+        model->devices.clear();
+    }
+
     for (const auto & dev : model->devices) {
         ggml_backend_dev_props props;
         ggml_backend_dev_get_props(dev.dev, &props);

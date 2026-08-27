@@ -1935,13 +1935,21 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     constexpr int I           = ggml_cuda_mmq_get_I(type, J, fallback);
     constexpr int sram_stride = ggml_cuda_mmq_get_sram_stride(type, J, fallback);
 
-#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
     int   * x_qs = (int   *) x_tile;
-    float * x_df = (float *) (x_qs + MMQ_TILE_NE_K*2);
+    float * x_df;
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+    if constexpr (type == GGML_TYPE_RQFP4) {
+        // RQFP4 is DP4A-routed on every CC (mmq.cuh), so x_df must sit after the
+        // DP4A qs section (I * (2*MMQ_TILE_NE_K + 1) int32s), NOT after the MMA
+        // layout's single-row offset (MMQ_TILE_NE_K*2).
+        constexpr tile_x_sizes txs = mmq_get_dp4a_tile_x_sizes(GGML_TYPE_RQFP4, I);
+        x_df = (float *) (x_qs + txs.qs);
+    } else {
+        x_df = (float *) (x_qs + MMQ_TILE_NE_K*2);
+    }
 #else
     constexpr tile_x_sizes txs = mmq_get_dp4a_tile_x_sizes(GGML_TYPE_NVFP4, I);
-    int   * x_qs = (int   *) x_tile;
-    float * x_df = (float *) (x_qs + txs.qs);
+    x_df = (float *) (x_qs + txs.qs);
 #endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
 
     constexpr int threads_per_row = MMQ_ITER_K / QK_NVFP4;
@@ -1957,29 +1965,59 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
             i = min(i, i_max);
         }
 
-        const block_nvfp4 * bxi = (const block_nvfp4 *) x + kb0 + i * stride + kbx;
-        const uint32_t * __restrict__ src_qs = reinterpret_cast<const uint32_t *>(bxi->qs);
         const int kqs = 16 * kbx;
         const int ksc = 4 * kbx;
 
+        if constexpr (type == GGML_TYPE_RQFP4) {
+            // RQFP4: own 40-B block (2x FP16 {scale,min} per 32-group) + uniform
+            // 16-level identity lattice. The 64-block's 2 x 32-group levels land in
+            // x_qs[16*kbx + 8*g ..] in NATURAL byte order (level of value j at byte j,
+            // 4 int32s per 32-group — rqfp4_expand_nibbles, NOT the evens/odds
+            // get_int_from_table_16 layout), the {d, m} pair in x_df[16*row + 2*(2*kbx+g) ..].
+            // ALWAYS the DP4A tile layout: RQFP4 is routed to the DP4A vec-dot on every
+            // CC (mmq.cuh: no MMA-path util funcs for RQFP4), so the arch #if below is
+            // intentionally not applied to this branch (TURING_MMA_AVAILABLE would
+            // otherwise emit the MMA layout and mismatch the DP4A dot).
+            const block_rqfp4 * bxi = (const block_rqfp4 *) x + kb0 + i * stride + kbx;
+            const uint32_t * __restrict__ src_qs = reinterpret_cast<const uint32_t *>(bxi->qs);
 #pragma unroll
-        for (int sub = 0; sub < QK_NVFP4 / QK_NVFP4_SUB; ++sub) {
-            const int2 q0 = get_int_from_table_16(src_qs[2 * sub + 0], kvalues_mxfp4);
-            const int2 q1 = get_int_from_table_16(src_qs[2 * sub + 1], kvalues_mxfp4);
-
+            for (int g = 0; g < 2; ++g) {
+                const int2 w0 = rqfp4_expand_nibbles(src_qs[4*g + 0]);
+                const int2 w1 = rqfp4_expand_nibbles(src_qs[4*g + 1]);
+                const int2 w2 = rqfp4_expand_nibbles(src_qs[4*g + 2]);
+                const int2 w3 = rqfp4_expand_nibbles(src_qs[4*g + 3]);
+                x_qs[i * (2 * MMQ_TILE_NE_K + 1) + 16*kbx + 8*g + 0] = w0.x;
+                x_qs[i * (2 * MMQ_TILE_NE_K + 1) + 16*kbx + 8*g + 1] = w0.y;
+                x_qs[i * (2 * MMQ_TILE_NE_K + 1) + 16*kbx + 8*g + 2] = w1.x;
+                x_qs[i * (2 * MMQ_TILE_NE_K + 1) + 16*kbx + 8*g + 3] = w1.y;
+                x_qs[i * (2 * MMQ_TILE_NE_K + 1) + 16*kbx + 8*g + 4] = w2.x;
+                x_qs[i * (2 * MMQ_TILE_NE_K + 1) + 16*kbx + 8*g + 5] = w2.y;
+                x_qs[i * (2 * MMQ_TILE_NE_K + 1) + 16*kbx + 8*g + 6] = w3.x;
+                x_qs[i * (2 * MMQ_TILE_NE_K + 1) + 16*kbx + 8*g + 7] = w3.y;
+                x_df[i * 16 + 2*(2*kbx + g) + 0] = __half2float(*reinterpret_cast<const __half *>(&bxi->d[g]));
+                x_df[i * 16 + 2*(2*kbx + g) + 1] = __half2float(*reinterpret_cast<const __half *>(&bxi->dmin[g]));
+            }
+        } else {
+            const block_nvfp4 * bxi = (const block_nvfp4 *) x + kb0 + i * stride + kbx;
+            const uint32_t * __restrict__ src_qs = reinterpret_cast<const uint32_t *>(bxi->qs);
+#pragma unroll
+            for (int sub = 0; sub < QK_NVFP4 / QK_NVFP4_SUB; ++sub) {
+                const int2 q0 = get_int_from_table_16(src_qs[2 * sub + 0], kvalues_mxfp4);
+                const int2 q1 = get_int_from_table_16(src_qs[2 * sub + 1], kvalues_mxfp4);
 #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
-            x_qs[i*sram_stride + kqs + 4 * sub + 0] = q0.x;
-            x_qs[i*sram_stride + kqs + 4 * sub + 1] = q1.x;
-            x_qs[i*sram_stride + kqs + 4 * sub + 2] = q0.y;
-            x_qs[i*sram_stride + kqs + 4 * sub + 3] = q1.y;
-            x_df[i*sram_stride + ksc + sub] = ggml_cuda_ue4m3_to_fp32(bxi->d[sub]);
+                x_qs[i*sram_stride + kqs + 4 * sub + 0] = q0.x;
+                x_qs[i*sram_stride + kqs + 4 * sub + 1] = q1.x;
+                x_qs[i*sram_stride + kqs + 4 * sub + 2] = q0.y;
+                x_qs[i*sram_stride + kqs + 4 * sub + 3] = q1.y;
+                x_df[i*sram_stride + ksc + sub] = ggml_cuda_ue4m3_to_fp32(bxi->d[sub]);
 #else
-            x_qs[i * (2 * MMQ_TILE_NE_K + 1) + kqs + 4 * sub + 0] = q0.x;
-            x_qs[i * (2 * MMQ_TILE_NE_K + 1) + kqs + 4 * sub + 1] = q1.x;
-            x_qs[i * (2 * MMQ_TILE_NE_K + 1) + kqs + 4 * sub + 2] = q0.y;
-            x_qs[i * (2 * MMQ_TILE_NE_K + 1) + kqs + 4 * sub + 3] = q1.y;
-            x_df[i * (2 * MMQ_TILE_NE_K * 2 / QI_NVFP4) + i / (QK_NVFP4_SUB / QI_NVFP4) + ksc + sub] = ggml_cuda_ue4m3_to_fp32(bxi->d[sub]);
+                x_qs[i * (2 * MMQ_TILE_NE_K + 1) + kqs + 4 * sub + 0] = q0.x;
+                x_qs[i * (2 * MMQ_TILE_NE_K + 1) + kqs + 4 * sub + 1] = q1.x;
+                x_qs[i * (2 * MMQ_TILE_NE_K + 1) + kqs + 4 * sub + 2] = q0.y;
+                x_qs[i * (2 * MMQ_TILE_NE_K + 1) + kqs + 4 * sub + 3] = q1.y;
+                x_df[i * (2 * MMQ_TILE_NE_K * 2 / QI_NVFP4) + i / (QK_NVFP4_SUB / QI_NVFP4) + ksc + sub] = ggml_cuda_ue4m3_to_fp32(bxi->d[sub]);
 #endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+            }
         }
     }
 }

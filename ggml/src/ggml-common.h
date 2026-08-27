@@ -226,6 +226,23 @@ typedef struct {
 } block_nvfp4;
 static_assert(sizeof(block_nvfp4) == sizeof(uint8_t)*(QK_NVFP4/QK_NVFP4_SUB) + QK_NVFP4/2, "wrong nvfp4 block size/padding");
 
+// RQFP4: WHT-rotated coefficients + RQ4's proven per-32 uniform 16-level recipe
+// (v = d*L - min, the min INSIDE the inverse WHT) with exact FP16 scale/min.
+// The per-32 alignment with the WHT-32 transform and the block offset (min) are
+// what keep the SSM-hybrid recurrence stable (RQ4 control, PPL 8.04, vs the
+// per-16-sign-mirrored variants which NaN at long context).
+#define QK_RQFP4 QK_NVFP4
+#define QK_RQFP4_SUB QK_NVFP4_SUB
+typedef struct {
+    ggml_half d[2];    // FP16 scale per 32-group (WHT-32 aligned)
+    ggml_half dmin[2]; // FP16 min  per 32-group
+    uint8_t   qs[32];  // packed 4-bit uniform levels (2 x 32 values)
+} block_rqfp4;
+static_assert(sizeof(block_rqfp4) == 2*sizeof(ggml_half)*(QK_RQFP4/32) + QK_RQFP4/2, "wrong rqfp4 block size/padding");
+#define QR_RQFP4 QR_NVFP4
+#define QI_RQFP4 (QK_RQFP4 / (4 * QR_RQFP4))
+
+
 #define QK5_0 32
 typedef struct {
     ggml_half d;           // delta
@@ -1205,6 +1222,12 @@ GGML_TABLE_BEGIN(int8_t, kvalues_fp4, 16)
     0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12,
 GGML_TABLE_END()
 #define kvalues_mxfp4 kvalues_fp4
+
+// RQFP4 uniform levels: the 4-bit nibble IS the level 0..15 (reconstruction
+// d*L - min, RQ4's per-32 recipe). Identity table for the shared decode helper.
+GGML_TABLE_BEGIN(int8_t, kvalues_rqfp4, 16)
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+GGML_TABLE_END()
 
 #define NGRID_IQ1S 2048
 #define IQ1S_DELTA 0.125f

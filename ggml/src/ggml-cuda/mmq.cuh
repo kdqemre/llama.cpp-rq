@@ -75,6 +75,10 @@ static mmq_q8_1_ds_layout mmq_get_q8_1_ds_layout(const ggml_type type_x) {
             return MMQ_Q8_1_DS_LAYOUT_D4;
         case GGML_TYPE_NVFP4:
             return MMQ_Q8_1_DS_LAYOUT_D4;
+        case GGML_TYPE_RQFP4:
+            // DS4: the RQFP4 MMQ dot needs the per-32 rotated activation sum (min
+            // term, ds.y); the rq4-rotated quantizer stores it in the s field.
+            return MMQ_Q8_1_DS_LAYOUT_DS4;
         case GGML_TYPE_Q2_K:
             return MMQ_Q8_1_DS_LAYOUT_D2S6;
         case GGML_TYPE_Q3_K:
@@ -232,54 +236,59 @@ static __host__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config(const ggml_type ty
     // RQ4 is byte-identical to Q4_K (block_rq4 == block_q4_K, 144 B), so it reuses
     // the Q4_K MMQ config (nthreads/I/sram_layout) verbatim.
     const ggml_type type = type_ == GGML_TYPE_RQ4 || type_ == GGML_TYPE_RQ3 || type_ == GGML_TYPE_RQ2 ? GGML_TYPE_Q4_K : type_;
+    // RQFP4 is byte-identical to NVFP4 (block_rqfp4 == block_nvfp4, 36 B) and uses
+    // the plain-dot q8_1 path, so it reuses the NVFP4 MMQ config verbatim.
+    const ggml_type type2 = type == GGML_TYPE_RQFP4 ? GGML_TYPE_NVFP4 : type;
     if (GGML_CUDA_CC_IS_AMD(cc)) {
         if (GGML_CUDA_CC_IS_CDNA(cc)) {
-            return ggml_cuda_mmq_get_config_cdna(type, J, fallback);
+            return ggml_cuda_mmq_get_config_cdna(type2, J, fallback);
         }
         if (GGML_CUDA_CC_IS_RDNA4(cc)) {
-            return ggml_cuda_mmq_get_config_rdna4(type, J, fallback);
+            return ggml_cuda_mmq_get_config_rdna4(type2, J, fallback);
         }
         if (GGML_CUDA_CC_IS_RDNA3_5(cc)) {
-            return ggml_cuda_mmq_get_config_rdna3_5(type, J, fallback);
+            return ggml_cuda_mmq_get_config_rdna3_5(type2, J, fallback);
         }
         if (GGML_CUDA_CC_IS_RDNA3(cc)) {  // covers RDNA 3.0
-            return ggml_cuda_mmq_get_config_rdna3(type, J, fallback);
+            return ggml_cuda_mmq_get_config_rdna3(type2, J, fallback);
         }
-        return ggml_cuda_mmq_get_config_rdna2(type, J, fallback);
+        return ggml_cuda_mmq_get_config_rdna2(type2, J, fallback);
     }
     if (blackwell_mma_available(cc)) {
-        return ggml_cuda_mmq_get_config_blackwell(type, J, fallback);
+        return ggml_cuda_mmq_get_config_blackwell(type2, J, fallback);
     }
     if (ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA) {
-        return ggml_cuda_mmq_get_config_ampere(type, J, fallback);
+        return ggml_cuda_mmq_get_config_ampere(type2, J, fallback);
     }
-    return ggml_cuda_mmq_get_config_pascal(type, J, fallback);
+    return ggml_cuda_mmq_get_config_pascal(type2, J, fallback);
 }
 
 static constexpr __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config(ggml_type type_, int J, bool fallback) {
     const ggml_type type = type_ == GGML_TYPE_RQ4 || type_ == GGML_TYPE_RQ3 || type_ == GGML_TYPE_RQ2 ? GGML_TYPE_Q4_K : type_;
+    // RQFP4 reuses the NVFP4 MMQ config (byte-identical block, plain-dot q8_1 path).
+    const ggml_type type2 = type == GGML_TYPE_RQFP4 ? GGML_TYPE_NVFP4 : type;
 #ifdef GGML_USE_HIP
 #ifdef CDNA
-    return ggml_cuda_mmq_get_config_cdna(type, J, fallback);
+    return ggml_cuda_mmq_get_config_cdna(type2, J, fallback);
 #elif defined(RDNA4)
-    return ggml_cuda_mmq_get_config_rdna4(type, J, fallback);
+    return ggml_cuda_mmq_get_config_rdna4(type2, J, fallback);
 #elif defined(RDNA3_5)
-    return ggml_cuda_mmq_get_config_rdna3_5(type, J, fallback);
+    return ggml_cuda_mmq_get_config_rdna3_5(type2, J, fallback);
 #elif defined(RDNA3)
-    return ggml_cuda_mmq_get_config_rdna3(type, J, fallback);
+    return ggml_cuda_mmq_get_config_rdna3(type2, J, fallback);
 #else
-    return ggml_cuda_mmq_get_config_rdna2(type, J, fallback);
+    return ggml_cuda_mmq_get_config_rdna2(type2, J, fallback);
 #endif // CDNA
 #else
 #ifdef BLACKWELL_MMA_AVAILABLE
-    return ggml_cuda_mmq_get_config_blackwell(type, J, fallback);
+    return ggml_cuda_mmq_get_config_blackwell(type2, J, fallback);
 #elif __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
-    return ggml_cuda_mmq_get_config_ampere(type, J, fallback);
+    return ggml_cuda_mmq_get_config_ampere(type2, J, fallback);
 #else
-    return ggml_cuda_mmq_get_config_pascal(type, J, fallback);
+    return ggml_cuda_mmq_get_config_pascal(type2, J, fallback);
 #endif // BLACKWELL_MMA_AVAILABLE
 #endif // GGML_USE_HIP
-    GGML_UNUSED_VARS(type, J, fallback);
+    GGML_UNUSED_VARS(type2, J, fallback);
 }
 
 static __host__ int ggml_cuda_mmq_get_type(const ggml_type type, const int J, const bool fallback, const int cc) {
@@ -401,6 +410,7 @@ static constexpr __host__ __device__ tile_x_sizes mmq_get_dp4a_tile_x_sizes(ggml
         case GGML_TYPE_Q8_0:    return MMQ_DP4A_TXS_Q8_0;
         case GGML_TYPE_MXFP4:   return MMQ_DP4A_TXS_Q8_1;
         case GGML_TYPE_NVFP4:   return MMQ_DP4A_TXS_Q8_0_16;
+        case GGML_TYPE_RQFP4:   return MMQ_DP4A_TXS_Q8_0_16;
         case GGML_TYPE_Q2_K:    return MMQ_DP4A_TXS_Q2_K;
         case GGML_TYPE_Q3_K:    return MMQ_DP4A_TXS_Q3_K;
         case GGML_TYPE_Q4_K:    return MMQ_DP4A_TXS_Q4_K;
@@ -546,7 +556,10 @@ template <ggml_type type, int J, bool fallback>
 static constexpr __device__ ggml_cuda_mmq_util_funcs ggml_cuda_mmq_get_util_funcs() {
     constexpr int I = ggml_cuda_mmq_get_I(type, J, fallback);
 
-    if (!ggml_cuda_mmq_get_config(type, J, fallback).use_mma_data_layout()) {
+    if (!ggml_cuda_mmq_get_config(type, J, fallback).use_mma_data_layout() || type == GGML_TYPE_RQFP4) {
+        // RQFP4 has no MMA-path util funcs (its per-32 {d,min} + min-term dot is
+        // DP4A-only), so it must use the DP4A switch on every CC. The load-tiles
+        // RQFP4 branch writes the DP4A tile layout unconditionally to match.
         switch (type) {
             case GGML_TYPE_Q1_0:
                 return ggml_cuda_mmq_util_funcs(
@@ -700,6 +713,14 @@ static constexpr __device__ ggml_cuda_mmq_util_funcs ggml_cuda_mmq_get_util_func
                     VDR_NVFP4_Q8_1_MMQ,
                     ggml_cuda_mmq_load_tiles_nvfp4<type, J, fallback>,
                     ggml_cuda_mmq_vec_dot_q8_0_16_q8_1_dp4a<type, J, fallback>,
+                    ggml_cuda_mmq_write_back_dp4a<type, J, fallback>);
+            case GGML_TYPE_RQFP4:
+                // RQFP4: own 40-B block (per-32 {scale, min}) + uniform levels; the
+                // DP4A path applies the per-32 min term via the y-tile sums.
+                return ggml_cuda_mmq_util_funcs(
+                    VDR_NVFP4_Q8_1_MMQ,
+                    ggml_cuda_mmq_load_tiles_nvfp4<type, J, fallback>,
+                    ggml_cuda_mmq_vec_dot_rqfp4_q8_1_dp4a<type, J, fallback>,
                     ggml_cuda_mmq_write_back_dp4a<type, J, fallback>);
             default:
                 return ggml_cuda_mmq_util_funcs(1, nullptr, nullptr, nullptr);
@@ -1637,6 +1658,7 @@ extern DECL_MMQ_CASE(GGML_TYPE_IQ4_XS);
 // -----------------------------------------
 extern DECL_MMQ_CASE(GGML_TYPE_MXFP4);
 extern DECL_MMQ_CASE(GGML_TYPE_NVFP4);
+extern DECL_MMQ_CASE(GGML_TYPE_RQFP4);
 
 // -------------------------------------------------------------------------------------------------------------------------
 

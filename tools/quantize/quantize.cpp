@@ -70,6 +70,7 @@ static const std::vector<quant_option> QUANT_OPTIONS = {
     { "RQ3_K_L",  LLAMA_FTYPE_MOSTLY_RQ3_K_L, " 3.50 bpw Rotated Quant 3-bit Large", },
     { "RQ2_K_L",  LLAMA_FTYPE_MOSTLY_RQ2_K_L, " 2.50 bpw Rotated Quant 2-bit Large", },
     { "NVFP4",    LLAMA_FTYPE_MOSTLY_NVFP4,   " 4.50 bpw NVIDIA FP4 (E2M1 + E4M3 block scales)", },
+    { "RQFP4",    LLAMA_FTYPE_MOSTLY_RQFP4,   " 4.50 bpw Rotated FP4 (E2M1 + E4M3 block scales, WHT)", },
     { "Q8_0",     LLAMA_FTYPE_MOSTLY_Q8_0,     " 7.96G, +0.0026 ppl @ Llama-3-8B",  },
     { "F16",      LLAMA_FTYPE_MOSTLY_F16,      "14.00G, +0.0020 ppl @ Mistral-7B",  },
     { "BF16",     LLAMA_FTYPE_MOSTLY_BF16,     "14.00G, -0.0050 ppl @ Mistral-7B",  },
@@ -126,7 +127,7 @@ static bool try_parse_ftype(const std::string & ftype_str_in, llama_ftype & ftyp
 static void usage(const char * executable) {
     printf("usage: %s [--help] [--allow-requantize] [--leave-output-tensor] [--pure] [--imatrix] [--include-weights]\n", executable);
     printf("       [--exclude-weights] [--output-tensor-type] [--token-embedding-type] [--tensor-type] [--tensor-type-file]\n");
-    printf("       [--prune-layers] [--keep-split] [--override-kv] [--dry-run]\n");
+    printf("       [--prune-layers] [--keep-split] [--override-kv] [--dry-run] [--quant-stats]\n");
     printf("       model-f32.gguf [model-quant.gguf] type [nthreads]\n\n");
     printf("  --allow-requantize\n");
     printf("                                      allow requantizing tensors that have already been quantized\n");
@@ -447,6 +448,8 @@ int llama_quantize(int argc, char ** argv) {
             }
         } else if (strcmp(argv[arg_idx], "--dry-run") == 0) {
             params.dry_run = true;
+        } else if (strcmp(argv[arg_idx], "--quant-stats") == 0) {
+            params.quant_stats = true;
         } else if (strcmp(argv[arg_idx], "--allow-requantize") == 0) {
             params.allow_requantize = true;
         } else if (strcmp(argv[arg_idx], "--pure") == 0) {

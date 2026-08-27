@@ -407,8 +407,10 @@ llama_context::llama_context(
             auto * buft = ggml_backend_get_default_buffer_type(backend.get());
             auto backend_type = ggml_backend_dev_type(ggml_backend_get_device(backend.get()));
 
-            if (backend_type == GGML_BACKEND_DEVICE_TYPE_CPU && !model.devices.empty()) {
+            if (backend_type == GGML_BACKEND_DEVICE_TYPE_CPU && !model.devices.empty() && model.n_gpu_layers() > 0) {
                 // use the host buffer of the first device CPU for faster transfer of the intermediate state
+                // only when layers are actually offloaded: the CUDA host buffer's allocation layout
+                // corrupts the CPU graph for RQFP4-sized models when everything runs on the CPU.
                 const auto & dev = model.devices[0];
                 auto * host_buft = ggml_backend_dev_host_buffer_type(dev.dev);
                 if (host_buft) {

@@ -573,6 +573,74 @@ static void dequantize_row_nvfp4_cuda(
     const int nb = k / QK_NVFP4;
     dequantize_block_nvfp4<<<nb, 32, 0, stream>>>(vx, y, k);
 }
+
+// RQFP4 dequant: per-32 uniform levels (d*L - min) + inverse sign-flipped WHT per
+// 32-group, so the output is the NATURAL-domain weights. Needed by the cuBLAS
+// fallback path (matmuls with ne01 % 128 != 0, e.g. the MTP nextn heads) and
+// cpy/convert ops.
+template <typename dst_t>
+static __global__ void dequantize_block_rqfp4(
+        const void * __restrict__ vx,
+        dst_t * __restrict__ yy,
+        const int64_t ne) {
+    const int64_t i = blockIdx.x;
+    const int     tid = threadIdx.x;
+
+    const int64_t base = i * QK_RQFP4;
+    if (base >= ne) {
+        return;
+    }
+
+    const block_rqfp4 * x = (const block_rqfp4 *) vx;
+    const block_rqfp4 & xb = x[i];
+
+    __shared__ float smem[QK_RQFP4];
+
+    const int j = tid; // element within each 32-group (0..31)
+
+    const float d0 = __half2float(*reinterpret_cast<const __half *>(&xb.d[0]));
+    const float m0 = __half2float(*reinterpret_cast<const __half *>(&xb.dmin[0]));
+    const uint8_t b0 = xb.qs[j/2];
+    const uint8_t L0 = (j & 1) ? (b0 >> 4) : (b0 & 0x0F);
+    smem[j] = d0*(float) L0 - m0;
+
+    const float d1 = __half2float(*reinterpret_cast<const __half *>(&xb.d[1]));
+    const float m1 = __half2float(*reinterpret_cast<const __half *>(&xb.dmin[1]));
+    const uint8_t b1 = xb.qs[16 + j/2];
+    const uint8_t L1 = (j & 1) ? (b1 >> 4) : (b1 & 0x0F);
+    smem[32 + j] = d1*(float) L1 - m1;
+    __syncthreads();
+
+    // Inverse WHT per 32-group. Shuffle butterfly (lane & step ? other-val : other+val)
+    // matches rq4_rht_inverse exactly (same ascending steps; H is an involution).
+    float val0 = smem[tid];        // group 0, lane tid
+    float val1 = smem[32 + tid];   // group 1, lane tid
+#pragma unroll
+    for (int step = 1; step < 32; step <<= 1) {
+        const float other0 = __shfl_xor_sync(0xFFFFFFFF, val0, step, 32);
+        const float other1 = __shfl_xor_sync(0xFFFFFFFF, val1, step, 32);
+        val0 = (tid & step) ? (other0 - val0) : (other0 + val0);
+        val1 = (tid & step) ? (other1 - val1) : (other1 + val1);
+    }
+    static constexpr float inv_sqrt32 = 0.1767766952966369f; // 1/sqrt(32)
+    val0 *= inv_sqrt32 * ggml_cuda_rq4_signs_dev[tid];
+    val1 *= inv_sqrt32 * ggml_cuda_rq4_signs_dev[tid];
+
+    yy[base + tid]      = ggml_cuda_cast<dst_t>(val0);
+    yy[base + 32 + tid] = ggml_cuda_cast<dst_t>(val1);
+}
+
+template <typename dst_t>
+static void dequantize_row_rqfp4_cuda(
+        const void * vx,
+        dst_t * y,
+        const int64_t k,
+        cudaStream_t stream) {
+    GGML_ASSERT(k % QK_RQFP4 == 0);
+    ggml_cuda_rq4_init_signs();
+    const int nb = k / QK_RQFP4;
+    dequantize_block_rqfp4<<<nb, 32, 0, stream>>>(vx, y, k);
+}
 template <typename src_t, typename dst_t>
 static __global__ void convert_unary(
         const void * __restrict__ vx, dst_t * __restrict__ y, const int64_t ne00, const int64_t ne01,
@@ -669,6 +737,8 @@ to_bf16_cuda_t ggml_get_to_bf16_cuda(ggml_type type) {
             return dequantize_row_mxfp4_cuda;
         case GGML_TYPE_NVFP4:
             return dequantize_row_nvfp4_cuda;
+        case GGML_TYPE_RQFP4:
+            return dequantize_row_rqfp4_cuda;
         case GGML_TYPE_F32:
             return convert_unary_cont_cuda<float>;
         case GGML_TYPE_F16:
@@ -735,6 +805,8 @@ to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
             return dequantize_row_mxfp4_cuda;
         case GGML_TYPE_NVFP4:
             return dequantize_row_nvfp4_cuda;
+        case GGML_TYPE_RQFP4:
+            return dequantize_row_rqfp4_cuda;
         case GGML_TYPE_F32:
             return convert_unary_cont_cuda<float>;
         case GGML_TYPE_BF16:
@@ -798,6 +870,8 @@ to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type) {
             return dequantize_row_mxfp4_cuda;
         case GGML_TYPE_NVFP4:
             return dequantize_row_nvfp4_cuda;
+        case GGML_TYPE_RQFP4:
+            return dequantize_row_rqfp4_cuda;
         case GGML_TYPE_F16:
             return convert_unary_cont_cuda<half>;
         case GGML_TYPE_BF16:

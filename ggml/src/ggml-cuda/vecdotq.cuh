@@ -29,6 +29,20 @@ static __device__ __forceinline__ int get_int_b4(const void * x, const int & i32
     return ((const int *) x)[i32]; // assume at least 4 byte alignment
 }
 
+// Natural-order 4-bit expansion: byte i of the result = the nibble i of q4
+// (level of the value i). Returns int2 (8 bytes for the 8 nibbles) so the dp4a
+// pairs level(j) with q8(j). get_int_from_table_16's evens/odds layout would
+// scramble the pairing for the RQFP4 uniform-level dot (verified numerically).
+static __device__ __forceinline__ int2 rqfp4_expand_nibbles(int q4) {
+    int2 r = make_int2(0, 0);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        r.x |= ((q4 >> (4*i)) & 0xF) << (8*i);
+        r.y |= ((q4 >> (4*(i+4))) & 0xF) << (8*i);
+    }
+    return r;
+}
+
 // q4 contains 8 indices with 4 bit each.
 // This function selects those bytes from table that are at those indices and returns them as int2.
 // The first int contains the bytes with even indices in q4, the second int contains the bytes with odd indices in q4.
@@ -332,12 +346,57 @@ static __device__ __forceinline__ float vec_dot_mxfp4_q8_1(
 #define VDR_NVFP4_Q8_1_MMVQ 4
 #define VDR_NVFP4_Q8_1_MMQ  8
 
+template <bool RQFP4 = false>
 static __device__ __forceinline__ float vec_dot_nvfp4_q8_1(
                                         const void * __restrict__ vbq,
                                         const block_q8_1 * __restrict__ bq8_1,
                                         const int32_t & kbx,
                                         const int32_t & iqs) {
 
+    if constexpr (RQFP4) {
+        // RQFP4: uniform levels (nibble = level 0..15), per-32 {d,min} (FP16);
+        // reconstruction d*L - min; the -min term uses the q8_1 activation sum.
+        // Each call covers one 32-group (int32s {iqs..iqs+3}).
+        // NOTE: levels must be expanded in NATURAL byte order (level of value j at
+        // byte j) so the dp4a pairs level(j) with q8(j). get_int_from_table_16
+        // returns evens/odds interleaved for the q4_K-style signed tables, which
+        // scrambles the pairing here (verified numerically: wrong dot).
+        const block_rqfp4 * bq = (const block_rqfp4 *) vbq + kbx;
+        const int g2 = (iqs >> 2) & 1;   // 32-group within the 64-block
+        const int bo = (iqs >> 3);       // extra 64-blocks (iqs = 8 or 12)
+        float sum = 0.0f;
+#pragma unroll
+        for (int i = 0; i < VDR_NVFP4_Q8_1_MMVQ/2; i++) {
+            const int32_t iqs0 = iqs + 2*i;
+            const int32_t iqs1 = iqs0 + 1;
+            const int2 w0 = rqfp4_expand_nibbles(get_int_b4(bq[bo].qs, iqs0 - 8*bo));
+            const int2 w1 = rqfp4_expand_nibbles(get_int_b4(bq[bo].qs, iqs1 - 8*bo));
+            const int32_t is = iqs0 >> 1;
+            const block_q8_1 * bq8 = bq8_1 + (is >> 1);
+            const int32_t i8 = ((is & 1) << 2);
+
+            int sumi = ggml_cuda_dp4a(w0.x, get_int_b4(bq8->qs, i8 + 0), 0);
+            sumi = ggml_cuda_dp4a(w0.y, get_int_b4(bq8->qs, i8 + 1), sumi);
+            sumi = ggml_cuda_dp4a(w1.x, get_int_b4(bq8->qs, i8 + 2), sumi);
+            sumi = ggml_cuda_dp4a(w1.y, get_int_b4(bq8->qs, i8 + 3), sumi);
+
+            // min term: the rq4 prep zeroes the q8_1 ds.y (rotated sum lives in the Sa
+            // sidecar, unused here) — so reconstruct the activation sum from the q8
+            // values x scale (dot2 chain), exactly like vec_dot_rq4_q8_1_rot.
+            int sumi_a = ggml_cuda_dp4a(0x01010101, get_int_b4(bq8->qs, i8 + 0), 0);
+            sumi_a = ggml_cuda_dp4a(0x01010101, get_int_b4(bq8->qs, i8 + 1), sumi_a);
+            sumi_a = ggml_cuda_dp4a(0x01010101, get_int_b4(bq8->qs, i8 + 2), sumi_a);
+            sumi_a = ggml_cuda_dp4a(0x01010101, get_int_b4(bq8->qs, i8 + 3), sumi_a);
+
+            const float d = __half2float(*reinterpret_cast<const __half *>(&bq[bo].d[g2])) * __low2float(bq8->ds);
+            const float m = __half2float(*reinterpret_cast<const __half *>(&bq[bo].dmin[g2]));
+            const float s = __low2float(bq8->ds) * float(sumi_a);
+            sum += d * float(sumi) - m * s;
+        }
+        return sum;
+    }
+
+    // NVFP4: E2M1 table (kvalues_mxfp4) + UE4M3 scales.
     const block_nvfp4 * bq4 = (const block_nvfp4 *) vbq + kbx;
     float sum = 0.0f;
 #pragma unroll

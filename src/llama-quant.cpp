@@ -435,6 +435,23 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type 
         return GGML_TYPE_NVFP4;
     }
 
+    // RQFP4: quantize every allowed 2d/3d weight tensor to RQFP4 (WHT-rotated
+    // E2M1 + per-16 UE4M3 sub-scales). token_embd/output are read via get_rows
+    // (no rotation) so they must NOT be RQFP4 -> elevate to Q6_K (get_rows for
+    // Q6_K exists everywhere; +~0.1 bpw on the ~4.7% embd).
+    if (ftype == LLAMA_FTYPE_MOSTLY_RQFP4) {
+        if (category == tensor_category::TOKEN_EMBD || category == tensor_category::OUTPUT) {
+            return GGML_TYPE_Q6_K;
+        }
+        // SSM tensors feed the hybrid delta-net recurrence (state *= exp(g) per
+        // token); the rotation+FP4 error there amplifies exponentially ->
+        // keep them at Q6_K.
+        if (name.find(".ssm_") != std::string::npos) {
+            return GGML_TYPE_Q6_K;
+        }
+        return GGML_TYPE_RQFP4;
+    }
+
     auto use_more_bits = [](int i_layer, int n_layers) -> bool {
         return i_layer < n_layers/8 || i_layer >= 7*n_layers/8 || (i_layer - n_layers/8)%3 == 2;
     };
@@ -870,6 +887,7 @@ ggml_type llama_ftype_get_default_type(llama_ftype ftype) {
 
         case LLAMA_FTYPE_MOSTLY_MXFP4_MOE: return GGML_TYPE_MXFP4;
         case LLAMA_FTYPE_MOSTLY_NVFP4:     return GGML_TYPE_NVFP4;
+        case LLAMA_FTYPE_MOSTLY_RQFP4:     return GGML_TYPE_RQFP4;
 
         // K-quants
         case LLAMA_FTYPE_MOSTLY_Q2_K_S:
@@ -1317,6 +1335,43 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
 
                     new_size += llama_tensor_quantize_impl(new_type, f32_data_03, new_data_03, chunk_size, nrows, n_per_row, imatrix_03, workers, nthread_use);
                 }
+
+                if (params->quant_stats && ggml_is_quantized(new_type)) {
+                    // Per-tensor quantize/dequantize error stats on sampled rows:
+                    // NMSE, max|err|, zeroed-16-group fraction, per-32-block mean bias RMS.
+                    const int64_t n_sample = std::min<int64_t>(8, std::max<int64_t>(1, nrows / 1024));
+                    const int64_t step = std::max<int64_t>(1, nrows / n_sample);
+                    double s_nmse = 0, s_maxerr = 0, s_zero = 0, s_bias = 0;
+                    std::vector<float> dq(n_per_row);
+                    const ggml_to_float_t dequant_row = ggml_get_type_traits(new_type)->to_float;
+                    for (int64_t r = 0; r < nrows; r += step) {
+                        dequant_row((const char *) new_data + ggml_row_size(new_type, n_per_row) * r, dq.data(), n_per_row);
+                        const float * src = f32_data + r * n_per_row;
+                        double se = 0, s2 = 0, maxerr = 0, bias_sq = 0;
+                        int nzero = 0;
+                        for (int64_t j = 0; j < n_per_row; j += 16) {
+                            bool z = true;
+                            for (int k = 0; k < 16; ++k) if (dq[j+k] != 0.0f) z = false;
+                            if (z) ++nzero;
+                        }
+                        for (int64_t j = 0; j < n_per_row; j += 32) {
+                            double bsum = 0;
+                            for (int k = 0; k < 32; ++k) bsum += (double) dq[j+k] - src[j+k];
+                            bias_sq += (bsum/32.0) * (bsum/32.0);
+                        }
+                        for (int64_t j = 0; j < n_per_row; ++j) {
+                            const double e = (double) dq[j] - src[j];
+                            se += e*e; s2 += (double) src[j]*src[j];
+                            maxerr = std::max(maxerr, std::fabs(e));
+                        }
+                        s_nmse += se/s2; s_maxerr += maxerr;
+                        s_zero  += (double) nzero / (n_per_row/16);
+                        s_bias  += bias_sq / (n_per_row/32);
+                    }
+                    LLAMA_LOG_INFO("quant-stats %-36s %-5s: NMSE %.5f max|err| %.3g zeroed16 %.4f bias32 %.5f\n",
+                                   ggml_get_name(tensor), ggml_type_name(new_type),
+                                   s_nmse/n_sample, s_maxerr/n_sample, s_zero/n_sample, std::sqrt(s_bias/n_sample));
+                }
                 LLAMA_LOG_INFO("size = %8.2f MiB -> %8.2f MiB\n", tensor_size/1024.0/1024.0, new_size/1024.0/1024.0);
             }
             total_size_org += tensor_size;
@@ -1368,6 +1423,7 @@ llama_model_quantize_params llama_model_quantize_default_params() {
         /*.pure                        =*/ false,
         /*.keep_split                  =*/ false,
         /*.dry_run                     =*/ false,
+        /*.quant_stats                 =*/ false,
         /*.imatrix                     =*/ nullptr,
         /*.kv_overrides                =*/ nullptr,
         /*.tensor_type                 =*/ nullptr,

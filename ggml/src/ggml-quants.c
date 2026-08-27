@@ -347,6 +347,14 @@ static inline int best_index_mxfp4(float x, float e) {
     return best_index;
 }
 
+// forward declarations: defined later in this file (RQ4 section)
+static void rq4_rht_forward(const float * GGML_RESTRICT in, float * GGML_RESTRICT out);
+static void rq4_rht_inverse(const float * GGML_RESTRICT in, float * GGML_RESTRICT out);
+static inline int nearest_int(float fval);
+static float make_qkx2_quants(int n, int nmax, const float * GGML_RESTRICT x, const float * GGML_RESTRICT weights,
+        uint8_t * GGML_RESTRICT L, float * GGML_RESTRICT the_min, uint8_t * GGML_RESTRICT Laux,
+        float rmin, float rdelta, int nstep, bool use_mad);
+
 void quantize_row_mxfp4_ref(const float * GGML_RESTRICT x, block_mxfp4 * GGML_RESTRICT y, int64_t k) {
     static const int qk = QK_MXFP4;
 
@@ -411,6 +419,67 @@ void quantize_row_nvfp4_ref(const float * GGML_RESTRICT x, block_nvfp4 * GGML_RE
                 const uint8_t x1 = best_index_mxfp4(xb[qk_sub/2 + j], d);
 
                 y[i].qs[s*(qk_sub/2) + j] = x0 | (x1 << 4);
+            }
+        }
+    }
+}
+
+void quantize_row_rqfp4_ref(const float * GGML_RESTRICT x, block_rqfp4 * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK_RQFP4;          // 64
+    assert(k % qk == 0);
+    const int nb = k / qk;
+    uint8_t L[32];
+    uint8_t Laux[32];
+    float weights[32];
+    float mins[2];
+    // Rotated values of the whole 256-superblock: Pass 2 re-fits the levels
+    // against the stored FP16 scale/min, so the pre-storage rotations of all
+    // four 64-blocks must survive until the superblock flush.
+    float rot_super[4*QK_RQFP4];
+    // Stage buffers for the 256-superblock: scales/mins are stored as exact
+    // FP16 (block_rqfp4 has full FP16 d/dmin per 32-group — no 63-step grid
+    // re-encode; RQ4 needs the grid only because its scales are 6-bit).
+    block_rqfp4 buf[4];
+    for (int i = 0; i < nb; i++) {
+        const float * xb_src = x + i*qk;
+        float * const rot = rot_super + qk*(i % 4);
+        for (int h = 0; h < 2; h++) {
+            // RQ4's proven per-32 recipe: forward-WHT, uniform 16-level (scale,min) fit
+            // (make_qkx2_quants, same params as quantize_row_rq4_ref). The min is
+            // inside the inverse WHT at dequant time.
+            const float * xj = xb_src + 32*h;
+            rq4_rht_forward(xj, rot + 32*h);
+            float sum_x2 = 0.0f;
+            for (int l = 0; l < 32; ++l) sum_x2 += rot[32*h+l] * rot[32*h+l];
+            const float av_x = sqrtf(sum_x2/32.0f);
+            for (int l = 0; l < 32; ++l) weights[l] = av_x + fabsf(rot[32*h+l]);
+            const float d = make_qkx2_quants(32, 15, rot + 32*h, weights, L, &mins[h], Laux, -1.f, 0.1f, 20, false);
+            buf[i % 4].d[h]    = GGML_FP32_TO_FP16(d);
+            buf[i % 4].dmin[h] = GGML_FP32_TO_FP16(mins[h]);
+        }
+        if ((i + 1) % 4 == 0 || i == nb - 1) {
+            // Flush the superblock (all 4 blocks, or the trailing partial
+            // group when k % 256 != 0): store the exact-FP16 scale/min and
+            // Pass-2 re-fit the levels against what is actually stored
+            // (mirrors quantize_row_rq4_ref lines 6062-6077).
+            const int nflush = ((i + 1) % 4 == 0) ? 4 : (i % 4) + 1;
+            for (int b = 0; b < nflush; ++b) {
+                for (int h = 0; h < 2; ++h) {
+                    y[i - (i%4) + b].d[h]    = buf[b].d[h];
+                    y[i - (i%4) + b].dmin[h] = buf[b].dmin[h];
+                    const float d_s = GGML_FP16_TO_FP32(buf[b].d[h]);
+                    const float m_s = GGML_FP16_TO_FP32(buf[b].dmin[h]);
+                    const float * rb = rot_super + qk*b + 32*h;
+                    if (d_s == 0.0f) {
+                        for (int l = 0; l < 16; ++l) y[i - (i%4) + b].qs[16*h + l] = 0;
+                    } else {
+                        for (int l = 0; l < 16; ++l) {
+                            int l0 = MAX(0, MIN(15, nearest_int((rb[2*l]     + m_s)/d_s)));
+                            int l1 = MAX(0, MIN(15, nearest_int((rb[2*l + 1] + m_s)/d_s)));
+                            y[i - (i%4) + b].qs[16*h + l] = l0 | (l1 << 4);
+                        }
+                    }
+                }
             }
         }
     }
@@ -608,6 +677,27 @@ void dequantize_row_nvfp4(const block_nvfp4 * GGML_RESTRICT x, float * GGML_REST
                 yb[j + qk_sub/2] = v1*d;
             }
         }
+    }
+}
+
+void dequantize_row_rqfp4(const block_rqfp4 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK_RQFP4, qk_sub = QK_RQFP4_SUB, n_sub = QK_RQFP4 / QK_RQFP4_SUB;
+    assert(k % qk == 0);
+    const int nb = k / qk;
+    float tmp[QK_RQFP4];
+    for (int i = 0; i < nb; i++) {
+        for (int h = 0; h < 2; h++) {
+            const float d = GGML_FP16_TO_FP32(x[i].d[h]);
+            const float m = GGML_FP16_TO_FP32(x[i].dmin[h]);
+            float * yb = tmp + 32*h;
+            for (int l = 0; l < 32; ++l) {
+                const uint8_t byte = x[i].qs[16*h + l/2];
+                const uint8_t L = (l & 1) ? (byte >> 4) : (byte & 0x0F);
+                yb[l] = d*(float) L - m;
+            }
+        }
+        rq4_rht_inverse(tmp,      y + i*qk);
+        rq4_rht_inverse(tmp + 32, y + i*qk + 32);
     }
 }
 
@@ -2309,6 +2399,12 @@ size_t quantize_nvfp4(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
     GGML_UNUSED(quant_weights);
     quantize_row_nvfp4_ref(src, dst, (int64_t)nrow*n_per_row);
     return nrow * ggml_row_size(GGML_TYPE_NVFP4, n_per_row);
+}
+
+size_t quantize_rqfp4(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    GGML_UNUSED(quant_weights);
+    quantize_row_rqfp4_ref(src, dst, (int64_t)nrow*n_per_row);
+    return nrow * ggml_row_size(GGML_TYPE_RQFP4, n_per_row);
 }
 
 // ====================== Ternary (de)-quantization (BitNet b1.58 and TriLMs)
@@ -5564,6 +5660,12 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
         case GGML_TYPE_NVFP4:
             {
                 // UE4M3 scales are uint8_t — all byte values are valid
+                GGML_UNUSED(data);
+                GGML_UNUSED(nb);
+            } break;
+        case GGML_TYPE_RQFP4:
+            {
+                // Same block layout as NVFP4 (UE4M3 scales + E2M1 nibbles) — all byte values valid
                 GGML_UNUSED(data);
                 GGML_UNUSED(nb);
             } break;

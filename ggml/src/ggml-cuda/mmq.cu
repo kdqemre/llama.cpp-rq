@@ -86,6 +86,9 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
         case GGML_TYPE_NVFP4:
             mul_mat_q_case<GGML_TYPE_NVFP4>(ctx, args, stream);
             break;
+        case GGML_TYPE_RQFP4:
+            mul_mat_q_case<GGML_TYPE_RQFP4>(ctx, args, stream);
+            break;
         default:
             GGML_ABORT("fatal error");
             break;
@@ -158,6 +161,7 @@ void ggml_cuda_mul_mat_q(
             const bool rq4 = (src0->type == GGML_TYPE_RQ4);
             const bool rq3 = (src0->type == GGML_TYPE_RQ3);
             const bool rq2 = (src0->type == GGML_TYPE_RQ2);
+            const bool rqnv = (src0->type == GGML_TYPE_RQFP4); // rotated FP4: same rq4 WHT
             if (use_native_fp4) {
                 static constexpr size_t align_float8 = 32;
                 const bool use_aligned_float8 = ggml_cuda_is_aligned(src1, align_float8);
@@ -169,7 +173,7 @@ void ggml_cuda_mul_mat_q(
                 // RQ4: forward-WHT is fused into the quantizer (rq4_rotate=true), eliminating
                 // the separate rotate_act FP32 pass. fp4 types are never RQ4 -> rq4=false there.
                 quantize_mmq_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded,
-                                       ne11, ne12, ne13, rq4 || rq3 || rq2, rq3, rq2, stream);
+                                       ne11, ne12, ne13, rq4 || rq3 || rq2 || rqnv, rq3, rq2, stream);
             }
             CUDA_CHECK(cudaGetLastError());
         }
@@ -311,6 +315,7 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
 // -------------------------------------------------
         case GGML_TYPE_MXFP4:
         case GGML_TYPE_NVFP4:
+        case GGML_TYPE_RQFP4:
             mmq_supported = true;
             break;
         default:
