@@ -1947,11 +1947,9 @@ template <ggml_type type, int J, bool fallback, ggml_prec prec_src1 = GGML_PREC_
     float * x_df;
 #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
     if constexpr (type == GGML_TYPE_RQFP4) {
-        // RQFP4 is DP4A-routed on every CC (mmq.cuh), so x_df must sit after the
-        // DP4A qs section (I * (2*MMQ_TILE_NE_K + 1) int32s), NOT after the MMA
-        // layout's single-row offset (MMQ_TILE_NE_K*2).
-        constexpr tile_x_sizes txs = mmq_get_dp4a_tile_x_sizes(GGML_TYPE_RQFP4, I);
-        x_df = (float *) (x_qs + txs.qs);
+        // RQFP4 rides the MMA path (mmq.cuh): x_dm half2s {d, -m} sit after the
+        // single-row qs offset (written in the loop below); no x_df on this path.
+        x_df = nullptr;
     } else {
         x_df = (float *) (x_qs + MMQ_TILE_NE_K*2);
     }
@@ -1978,14 +1976,36 @@ template <ggml_type type, int J, bool fallback, ggml_prec prec_src1 = GGML_PREC_
 
         if constexpr (type == GGML_TYPE_RQFP4) {
             // RQFP4: own 40-B block (2x FP16 {scale,min} per 32-group) + uniform
-            // 16-level identity lattice. The 64-block's 2 x 32-group levels land in
-            // x_qs[16*kbx + 8*g ..] in NATURAL byte order (level of value j at byte j,
-            // 4 int32s per 32-group — rqfp4_expand_nibbles, NOT the evens/odds
-            // get_int_from_table_16 layout), the {d, m} pair in x_df[16*row + 2*(2*kbx+g) ..].
-            // ALWAYS the DP4A tile layout: RQFP4 is routed to the DP4A vec-dot on every
-            // CC (mmq.cuh: no MMA-path util funcs for RQFP4), so the arch #if below is
-            // intentionally not applied to this branch (TURING_MMA_AVAILABLE would
-            // otherwise emit the MMA layout and mismatch the DP4A dot).
+            // 16-level identity lattice, levels stored in NATURAL byte order
+            // (level of value j at nibble j of qs).
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+            // MMA layout: the SRAM x_qs tile must be in NATURAL value order (slot s
+            // holds the 4 int8 levels of values 4s..4s+3 as bytes), which is what the
+            // stock q8_1_q8_1_mma dot's ldmatrix/mma k-pairing expects against the
+            // natural-order q8_1 y tile (mma pairs A spin (k0+c, byte b) with the y
+            // window value 4*(k0+c)+b). RQFP4's qs packs value j at nibble j
+            // (sequential), so expansion via rqfp4_expand_nibbles (int2 = values
+            // 8t..8t+3 / 8t+4..8t+7 for source int32 t) lands in slots 2t/2t+1:
+            // packed int32 t = 8*kbx + j writes slots kqs + 2j and kqs + 2j + 1.
+            // x_dm[i*sram_stride + 2*kbx + g] = {d_g, -m_g}: the stock dot computes
+            // dmA.x*dsB.x*C + dmA.y*dsB.y = d*sumi*d_s - m*S (the -m pre-negated,
+            // like Q4_K's dm*(1,-1) trick; d_s/S come from the DS4 y-sidecar).
+            const block_rqfp4 * bxi = (const block_rqfp4 *) x + kb0 + i * stride + kbx;
+            const uint32_t * __restrict__ src_qs = reinterpret_cast<const uint32_t *>(bxi->qs);
+            half2 * x_dm = (half2 *) (x_qs + 2*MMQ_TILE_NE_K);
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const int2 w = rqfp4_expand_nibbles(src_qs[j]);
+                x_qs[i * sram_stride + kqs + 2*j + 0] = w.x;
+                x_qs[i * sram_stride + kqs + 2*j + 1] = w.y;
+            }
+            x_dm[i * sram_stride + 2*kbx + 0] = make_half2(__half2float(*reinterpret_cast<const __half *>(&bxi->d[0])), -__half2float(*reinterpret_cast<const __half *>(&bxi->dmin[0])));
+            x_dm[i * sram_stride + 2*kbx + 1] = make_half2(__half2float(*reinterpret_cast<const __half *>(&bxi->d[1])), -__half2float(*reinterpret_cast<const __half *>(&bxi->dmin[1])));
+#else
+            // DP4A layout for non-MMA CCs (Pascal etc.): the 64-block's 2 x 32-group
+            // levels land in x_qs[16*kbx + 8*g ..] as 32 consecutive int8 values
+            // (rqfp4_expand_nibbles, NOT the evens/odds get_int_from_table_16
+            // layout), the {d, m} pair in x_df[16*row + 2*(2*kbx+g) ..].
             const block_rqfp4 * bxi = (const block_rqfp4 *) x + kb0 + i * stride + kbx;
             const uint32_t * __restrict__ src_qs = reinterpret_cast<const uint32_t *>(bxi->qs);
 #pragma unroll
@@ -2005,6 +2025,7 @@ template <ggml_type type, int J, bool fallback, ggml_prec prec_src1 = GGML_PREC_
                 x_df[i * 16 + 2*(2*kbx + g) + 0] = __half2float(*reinterpret_cast<const __half *>(&bxi->d[g]));
                 x_df[i * 16 + 2*(2*kbx + g) + 1] = __half2float(*reinterpret_cast<const __half *>(&bxi->dmin[g]));
             }
+#endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
         } else {
             const block_nvfp4 * bxi = (const block_nvfp4 *) x + kb0 + i * stride + kbx;
             const uint32_t * __restrict__ src_qs = reinterpret_cast<const uint32_t *>(bxi->qs);

@@ -560,10 +560,10 @@ struct ggml_cuda_mmq_util_funcs {
 
 template <ggml_type type, int J, bool fallback, ggml_prec prec_src1 = GGML_PREC_Q8>
 static constexpr __device__ ggml_cuda_mmq_util_funcs ggml_cuda_mmq_get_util_funcs() {
-    if (!ggml_cuda_mmq_get_config(type, J, fallback, prec_src1).use_mma_data_layout() || type == GGML_TYPE_RQFP4) {
-        // RQFP4 has no MMA-path util funcs (its per-32 {d,min} + min-term dot is
-        // DP4A-only), so it must use the DP4A switch on every CC. The load-tiles
-        // RQFP4 branch writes the DP4A tile layout unconditionally to match.
+    if (!ggml_cuda_mmq_get_config(type, J, fallback, prec_src1).use_mma_data_layout()) {
+        // DP4A switch: only for CCs without MMA. RQFP4 rides the MMA path on
+        // MMA-capable CCs via its NVFP4-aliased config and the Q4_K-convention
+        // {d, -m} x_dm written by the load-tiles MMA branch.
         switch (type) {
             case GGML_TYPE_Q1_0:
                 return ggml_cuda_mmq_util_funcs(
@@ -913,6 +913,15 @@ static constexpr __device__ ggml_cuda_mmq_util_funcs ggml_cuda_mmq_get_util_func
                 -1,
                 ggml_cuda_mmq_load_tiles_nvfp4<type, J, fallback, prec_src1>,
                 ggml_cuda_mmq_vec_dot_q8_0_16_q8_1_mma<type, J, fallback, prec_src1>,
+                ggml_cuda_mmq_write_back_mma<type, J, fallback>);
+        case GGML_TYPE_RQFP4:
+            // Q4_K-convention {d, -m} x_dm written by the loader's MMA branch; the
+            // stock dot applies d*sumi*d_s - m*S via the DS4 y-sidecar min-term
+            // (same dot as RQ4/Q4_K, same y-tile layout).
+            return ggml_cuda_mmq_util_funcs(
+                -1,
+                ggml_cuda_mmq_load_tiles_nvfp4<type, J, fallback, prec_src1>,
+                ggml_cuda_mmq_vec_dot_q8_1_q8_1_mma<type, J, fallback>,
                 ggml_cuda_mmq_write_back_mma<type, J, fallback>);
         default:
             return ggml_cuda_mmq_util_funcs(1, nullptr, nullptr, nullptr);

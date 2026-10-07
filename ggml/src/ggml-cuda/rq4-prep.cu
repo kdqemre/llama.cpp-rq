@@ -45,16 +45,19 @@ void ggml_cuda_rq4_rotate_act(
 // + fixup with a single launch. Grid/indexing mirrors quantize_q8_1 so the output
 // q8_1 buffer is layout-identical, but per 32-element sub-block (== one q8_1 block
 // == one warp) it:
-//   1. warp-reduces Sa = sum of the ORIGINAL activation (carried for the min term),
-//   2. applies the forward randomized Hadamard transform in-register (signs +
+//   1. applies the forward randomized Hadamard transform in-register (signs +
 //      32-point butterfly + 1/sqrt32) via warp shuffles,
-//   3. q8_1-quantizes the ROTATED values (d = amax/127),
-//   4. writes ds = (d_rotated, 0) -- Sa lives in the FP32 sidecar `sa_out`.
+//   2. q8_1-quantizes the ROTATED values (d = amax/127),
+//   3. writes ds = (d_rotated, sum(rotated q8)) -- ds.y is the INTEGER block sum
+//      used as the min term of the RQ dots (half-exact: |sum| <= 32*127 = 4064,
+//      evens above 2048 exact, odd values round by <= 1 q8-unit).
 // Math: <RHT_inverse(c), a> = <c, RHT_forward(a)>, so the WHT moves off the
 // weights onto the activation (once/token, amortized across all weight rows).
+// (v50.19: the old FP32 `sa_out` sidecar (ORIGINAL pre-rotation sum) had no
+// consumers and is gone; the dots read the rotated sum from ds.y instead.)
 // ---------------------------------------------------------------------------
 static __global__ void rq4_prep_act_kernel(
-        const float * __restrict__ x_ptr, block_q8_1 * __restrict__ vy, float * __restrict__ sa_out,
+        const float * __restrict__ x_ptr, block_q8_1 * __restrict__ vy,
         const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
         const int64_t ne0, const uint32_t ne1, const uint3 ne2) {
 
@@ -83,12 +86,6 @@ static __global__ void rq4_prep_act_kernel(
     // original activation value; 0 in the padded tail beyond ne00 (matches quantize_q8_1).
     const float av = i0 < ne00 ? x[i03 * s03 + i02 * s02 + i01 * s01 + i00] : 0.0f;
 
-    // Sa = sum of the ORIGINAL activation over this 32-element sub-block.
-    float Sa = warp_reduce_sum<QK8_1>(av);
-    if (lane == 0) {
-        sa_out[ib] = Sa;   // FP32 sidecar: full-precision min-term sum
-    }
-
     // Forward randomized Hadamard transform (32-point): signs + butterfly + 1/sqrt32.
     // Butterfly (lane & step) ? (other - val) : (other + val) matches the CPU
     // rq4_rht_forward loop exactly (verified against ggml-quants.c).
@@ -107,13 +104,14 @@ static __global__ void rq4_prep_act_kernel(
     const int8_t q = (amax == 0.0f) ? (int8_t) 0 : (int8_t) roundf(val / d);
 
     y[ib].qs[lane] = q;
+    const float qsum = warp_reduce_sum<QK8_1>((float) q);   // min-term block sum
     if (lane == 0) {
-        y[ib].ds = make_half2(d, 0.0f);   // s field unused; Sa lives in the FP32 sidecar
+        y[ib].ds = make_half2(d, qsum);   // ds.y = sum of the ROTATED q8 values
     }
 }
 
 void ggml_cuda_rq4_prep_act(
-        const float * x, block_q8_1 * vy, float * sa_out,
+        const float * x, block_q8_1 * vy,
         const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
         const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3, cudaStream_t stream) {
     GGML_ASSERT(ne0 % QK8_1 == 0);
@@ -126,5 +124,5 @@ void ggml_cuda_rq4_prep_act(
     const dim3 block_size(prep_block_size, 1, 1);
     const ggml_cuda_kernel_launch_params launch_params(num_blocks, block_size, 0, stream);
     ggml_cuda_kernel_launch(rq4_prep_act_kernel, launch_params,
-                            x, vy, sa_out, ne00, s01, s02, s03, ne0, (uint32_t) ne1, ne2_fastdiv);
+                            x, vy, ne00, s01, s02, s03, ne0, (uint32_t) ne1, ne2_fastdiv);
 }

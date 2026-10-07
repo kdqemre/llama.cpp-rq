@@ -45,7 +45,7 @@ void ggml_cuda_rq2_rotate_act(
 // ROTATED values, 4. writes ds = (d_rotated, 0) -- Sa lives in the FP32 sidecar.
 // ---------------------------------------------------------------------------
 static __global__ void rq2_prep_act_kernel(
-        const float * __restrict__ x_ptr, block_q8_1 * __restrict__ vy, float * __restrict__ sa_out,
+        const float * __restrict__ x_ptr, block_q8_1 * __restrict__ vy,
         const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
         const int64_t ne0, const uint32_t ne1, const uint3 ne2) {
 
@@ -73,11 +73,6 @@ static __global__ void rq2_prep_act_kernel(
     ggml_cuda_pdl_sync();
     const float av = i0 < ne00 ? x[i03 * s03 + i02 * s02 + i01 * s01 + i00] : 0.0f;
 
-    float Sa = warp_reduce_sum<QK8_1>(av);
-    if (lane == 0) {
-        sa_out[ib] = Sa;
-    }
-
     float val = av * ggml_cuda_rq2_signs_dev[lane];
 #pragma unroll
     for (int step = 1; step < 32; step <<= 1) {
@@ -92,13 +87,14 @@ static __global__ void rq2_prep_act_kernel(
     const int8_t q = (amax == 0.0f) ? (int8_t) 0 : (int8_t) roundf(val / d);
 
     y[ib].qs[lane] = q;
+    const float qsum = warp_reduce_sum<QK8_1>((float) q);   // min-term block sum
     if (lane == 0) {
-        y[ib].ds = make_half2(d, 0.0f);
+        y[ib].ds = make_half2(d, qsum);   // ds.y = sum of the ROTATED q8 values
     }
 }
 
 void ggml_cuda_rq2_prep_act(
-        const float * x, block_q8_1 * vy, float * sa_out,
+        const float * x, block_q8_1 * vy,
         const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
         const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3, cudaStream_t stream) {
     GGML_ASSERT(ne0 % QK8_1 == 0);
@@ -111,5 +107,5 @@ void ggml_cuda_rq2_prep_act(
     const dim3 block_size(prep_block_size, 1, 1);
     const ggml_cuda_kernel_launch_params launch_params(num_blocks, block_size, 0, stream);
     ggml_cuda_kernel_launch(rq2_prep_act_kernel, launch_params,
-                            x, vy, sa_out, ne00, s01, s02, s03, ne0, (uint32_t) ne1, ne2_fastdiv);
+                            x, vy, ne00, s01, s02, s03, ne0, (uint32_t) ne1, ne2_fastdiv);
 }

@@ -155,6 +155,7 @@ llama_build(test-recurrent-state-rollback.cpp)
     llama_build(test-rq2-cuda.cpp)
     llama_build(test-rq3-k-l-cuda.cpp)
     llama_build(test-rq4-cuda.cpp)
+    llama_build(test-rqfp4-cuda.cpp)
     llama_build(test-save-load-state.cpp)
 
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)

@@ -2025,9 +2025,9 @@ void ggml_cuda_mul_mat_vec_q(
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
     ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
     if (src0->type == GGML_TYPE_RQ4 || src0->type == GGML_TYPE_RQ3 || src0->type == GGML_TYPE_RQ2 || src0->type == GGML_TYPE_RQFP4) {
-        // RQ4/RQ3/RQFP4: forward-WHT-rotate the activation via the fused prep kernel (Kernel A):
-        // emits a layout-identical rotated q8_1 (ds.x = rotated scale, ds.y = 0) + an
-        // FP32 Sa sidecar carrying the original block sum. vec_dot_rq{4,3}_q8_1_rot
+        // RQ4/RQ3/RQ2/RQFP4: forward-WHT-rotate the activation via the fused prep kernel (Kernel A):
+        // emits a layout-identical rotated q8_1 (ds.x = rotated scale, ds.y = the rotated
+        // block sum used as the min term). vec_dot_rq{4,3}_q8_1_rot
         // (swapped in at get_vec_dot_q_cuda) dots the rotated q8 against the (already
         // rotated) stored weight levels. By WHT orthogonality <w_nat, a_nat> =
         // <w_rot, WHT(a_nat)> so the generic MMVQ path is correct for ALL ncols.
@@ -2040,18 +2040,17 @@ void ggml_cuda_mul_mat_vec_q(
         } else {
             ggml_cuda_rq2_init_signs();
         }
-        ggml_cuda_pool_alloc<float> src1_sa(ctx.pool(), ne13*ne12*ne11*ne10_padded / QK8_1);
         const int64_t s11 = src1->nb[1] / ts_src1;
         const int64_t s12 = src1->nb[2] / ts_src1;
         const int64_t s13 = src1->nb[3] / ts_src1;
         if (src0->type == GGML_TYPE_RQ4 || src0->type == GGML_TYPE_RQFP4) {
-            ggml_cuda_rq4_prep_act(src1_d, (block_q8_1 *) src1_q8_1.get(), src1_sa.get(),
+            ggml_cuda_rq4_prep_act(src1_d, (block_q8_1 *) src1_q8_1.get(),
                                        ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
         } else if (src0->type == GGML_TYPE_RQ3) {
-            ggml_cuda_rq3_prep_act(src1_d, (block_q8_1 *) src1_q8_1.get(), src1_sa.get(),
+            ggml_cuda_rq3_prep_act(src1_d, (block_q8_1 *) src1_q8_1.get(),
                                        ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
         } else {
-            ggml_cuda_rq2_prep_act(src1_d, (block_q8_1 *) src1_q8_1.get(), src1_sa.get(),
+            ggml_cuda_rq2_prep_act(src1_d, (block_q8_1 *) src1_q8_1.get(),
                                        ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
         }
     } else {
@@ -2139,17 +2138,16 @@ void ggml_cuda_op_mul_mat_vec_q(
         const bool is_rq2 = (src0->type == GGML_TYPE_RQ2);
         if (is_rq4) ggml_cuda_rq4_init_signs(); else if (is_rq2) ggml_cuda_rq2_init_signs(); else ggml_cuda_rq3_init_signs();
         ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(id), src1_ncols * src1_padded_row_size * sizeof(block_q8_1)/QK8_1);
-        ggml_cuda_pool_alloc<float> src1_sa(ctx.pool(id), src1_ncols * src1_padded_row_size / QK8_1);
         if (is_rq4) {
-            ggml_cuda_rq4_prep_act(src1_ddf_i, (block_q8_1 *) src1_q8_1.get(), src1_sa.get(),
+            ggml_cuda_rq4_prep_act(src1_ddf_i, (block_q8_1 *) src1_q8_1.get(),
                                        ne10, ne10, src1_ncols*ne10, src1_ncols*ne10,
                                        src1_padded_row_size, src1_ncols, 1, 1, stream);
         } else if (is_rq2) {
-            ggml_cuda_rq2_prep_act(src1_ddf_i, (block_q8_1 *) src1_q8_1.get(), src1_sa.get(),
+            ggml_cuda_rq2_prep_act(src1_ddf_i, (block_q8_1 *) src1_q8_1.get(),
                                        ne10, ne10, src1_ncols*ne10, src1_ncols*ne10,
                                        src1_padded_row_size, src1_ncols, 1, 1, stream);
         } else {
-            ggml_cuda_rq3_prep_act(src1_ddf_i, (block_q8_1 *) src1_q8_1.get(), src1_sa.get(),
+            ggml_cuda_rq3_prep_act(src1_ddf_i, (block_q8_1 *) src1_q8_1.get(),
                                        ne10, ne10, src1_ncols*ne10, src1_ncols*ne10,
                                        src1_padded_row_size, src1_ncols, 1, 1, stream);
         }

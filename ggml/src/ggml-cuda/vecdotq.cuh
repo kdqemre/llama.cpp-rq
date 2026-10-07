@@ -380,18 +380,14 @@ static __device__ __forceinline__ float vec_dot_nvfp4_q8_1(
             sumi = ggml_cuda_dp4a(w1.x, get_int_b4(bq8->qs, i8 + 2), sumi);
             sumi = ggml_cuda_dp4a(w1.y, get_int_b4(bq8->qs, i8 + 3), sumi);
 
-            // min term: the rq4 prep zeroes the q8_1 ds.y (rotated sum lives in the Sa
-            // sidecar, unused here) — so reconstruct the activation sum from the q8
-            // values x scale (dot2 chain), exactly like vec_dot_rq4_q8_1_rot.
-            int sumi_a = ggml_cuda_dp4a(0x01010101, get_int_b4(bq8->qs, i8 + 0), 0);
-            sumi_a = ggml_cuda_dp4a(0x01010101, get_int_b4(bq8->qs, i8 + 1), sumi_a);
-            sumi_a = ggml_cuda_dp4a(0x01010101, get_int_b4(bq8->qs, i8 + 2), sumi_a);
-            sumi_a = ggml_cuda_dp4a(0x01010101, get_int_b4(bq8->qs, i8 + 3), sumi_a);
-
+            // min term: ds.y carries the ROTATED block sum (integer, written by the
+            // prep kernel); the two 16-value halves of this loop share the same
+            // q8_1 block (is>>1 == iqs>>2 for both i), so the half==i==0 applies
+            // the full min term and the second adds none (no double count).
+            // Replaces the old 4-dp4a dot2 chain (v50.19).
             const float d = __half2float(*reinterpret_cast<const __half *>(&bq[bo].d[g2])) * __low2float(bq8->ds);
             const float m = __half2float(*reinterpret_cast<const __half *>(&bq[bo].dmin[g2]));
-            const float s = __low2float(bq8->ds) * float(sumi_a);
-            sum += d * float(sumi) - m * s;
+            sum += d * float(sumi) - (i == 0 ? m * __low2float(bq8->ds) * __high2float(bq8->ds) : 0.0f);
         }
         return sum;
     }
@@ -1111,24 +1107,24 @@ static __device__ __forceinline__ float vec_dot_rq4_q8_1_rot(
         w3 = qp_i[3] & 0x0F0F0F0F;
     }
 
-    // dot1 = <L, rotated_q8> (scale term); dot2 = sum(rotated_q8) (min term).
-    // Two independent chains — issue each chain's first dp4a back-to-back so they overlap.
+    // dot1 = <L, rotated_q8> (scale term); the min term comes from ds.y (the
+    // rotated block sum written by the prep kernel), applied only by the
+    // half==0 thread of each sub-block (the warp reduce totals it once).
     int dot1 = ggml_cuda_dp4a(w0, aq[0], 0);
-    int dot2 = ggml_cuda_dp4a(0x01010101, aq[0], 0);
     dot1     = ggml_cuda_dp4a(w1, aq[1], dot1);
-    dot2     = ggml_cuda_dp4a(0x01010101, aq[1], dot2);
     dot1     = ggml_cuda_dp4a(w2, aq[2], dot1);
-    dot2     = ggml_cuda_dp4a(0x01010101, aq[2], dot2);
     dot1     = ggml_cuda_dp4a(w3, aq[3], dot1);
-    dot2     = ggml_cuda_dp4a(0x01010101, aq[3], dot2);
 
     uint8_t sc, m;
     get_scale_min_k4_rq4(is, bq->scales, sc, m);
 
     // PARTIAL per-thread contribution (this half-sub-block); warp_reduce_sum combines the
     // 2 half partners per sub-block (and accumulates across superblocks) -> reconstructs
-    // d*sumf_d - dmin*sumf_m for the row.
-    return d * d_act * sc * (float) dot1 - dmin * d_act * m * (float) dot2;
+    // d*sumf_d - dmin*sumf_m for the row. The min term (dmin*d_act*m*sum(a_rot)) is
+    // carried only by the half==0 thread from ds.y (the prep-written rotated block
+    // sum); the warp reduce totals it exactly once per sub-block. (v50.19: replaces
+    // the old per-thread dot2 dp4a chain.)
+    return d * d_act * sc * (float) dot1 - (half == 0 ? dmin * d_act * m * __high2float(bq8_1[is].ds) : 0.0f);
 }
 
 #define VDR_RQ3_Q8_1_MMVQ 2
@@ -1176,20 +1172,20 @@ static __device__ __forceinline__ float vec_dot_rq3_q8_1_rot(
     const int w3 = (int)(RQ3_LVL(q3,0,h23,4)       | (RQ3_LVL(q3,1,h23,5) << 8)  | (RQ3_LVL(q3,2,h23,6) << 16) | (RQ3_LVL(q3,3,h23,7) << 24));
 #undef RQ3_LVL
 
-    // dot1 = <L, rotated_q8> (scale term); dot2 = sum(rotated_q8) (min term).
+    // dot1 = <L, rotated_q8> (scale term); the min term comes from ds.y (the
+    // rotated block sum written by the prep kernel), applied only by the
+    // half==0 thread of each sub-block (the warp reduce totals it once).
     int dot1 = ggml_cuda_dp4a(w0, aq[0], 0);
-    int dot2 = ggml_cuda_dp4a(0x01010101, aq[0], 0);
     dot1     = ggml_cuda_dp4a(w1, aq[1], dot1);
-    dot2     = ggml_cuda_dp4a(0x01010101, aq[1], dot2);
     dot1     = ggml_cuda_dp4a(w2, aq[2], dot1);
-    dot2     = ggml_cuda_dp4a(0x01010101, aq[2], dot2);
     dot1     = ggml_cuda_dp4a(w3, aq[3], dot1);
-    dot2     = ggml_cuda_dp4a(0x01010101, aq[3], dot2);
 
     uint8_t sc, m;
     get_scale_min_k4_rq4(isub, bq->scales, sc, m);
 
-    return d * d_act * sc * (float) dot1 - dmin * d_act * m * (float) dot2;
+    // min term from ds.y (the prep-written rotated block sum), carried only by
+    // the half==0 thread; the warp reduce totals it once per sub-block. (v50.19)
+    return d * d_act * sc * (float) dot1 - (half == 0 ? dmin * d_act * m * __high2float(bq8_1[isub].ds) : 0.0f);
 }
 #define VDR_RQ2_Q8_1_MMVQ 2
 #define VDR_RQ2_Q8_1_MMQ  8
@@ -1230,20 +1226,20 @@ static __device__ __forceinline__ float vec_dot_rq2_q8_1_rot(
     const int w3 = (int)(RQ2_LVL(q3,0)       | (RQ2_LVL(q3,1) << 8)  | (RQ2_LVL(q3,2) << 16) | (RQ2_LVL(q3,3) << 24));
 #undef RQ2_LVL
 
-    // dot1 = <L, rotated_q8> (scale term); dot2 = sum(rotated_q8) (min term).
+    // dot1 = <L, rotated_q8> (scale term); the min term comes from ds.y (the
+    // rotated block sum written by the prep kernel), applied only by the
+    // half==0 thread of each sub-block (the warp reduce totals it once).
     int dot1 = ggml_cuda_dp4a(w0, aq[0], 0);
-    int dot2 = ggml_cuda_dp4a(0x01010101, aq[0], 0);
     dot1     = ggml_cuda_dp4a(w1, aq[1], dot1);
-    dot2     = ggml_cuda_dp4a(0x01010101, aq[1], dot2);
     dot1     = ggml_cuda_dp4a(w2, aq[2], dot1);
-    dot2     = ggml_cuda_dp4a(0x01010101, aq[2], dot2);
     dot1     = ggml_cuda_dp4a(w3, aq[3], dot1);
-    dot2     = ggml_cuda_dp4a(0x01010101, aq[3], dot2);
 
     uint8_t sc, m;
     get_scale_min_k4_rq4(isub, bq->scales, sc, m);
 
-    return d * d_act * sc * (float) dot1 - dmin * d_act * m * (float) dot2;
+    // min term from ds.y (the prep-written rotated block sum), carried only by
+    // the half==0 thread; the warp reduce totals it once per sub-block. (v50.19)
+    return d * d_act * sc * (float) dot1 - (half == 0 ? dmin * d_act * m * __high2float(bq8_1[isub].ds) : 0.0f);
 }
 
 static __device__ __forceinline__ float vec_dot_q5_K_q8_1(
